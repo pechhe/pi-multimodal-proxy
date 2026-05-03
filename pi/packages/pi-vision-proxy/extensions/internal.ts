@@ -465,6 +465,19 @@ export function modeLabel(mode: ProxyMode): string {
 	}
 }
 
+/** Fuzzy-match: true when every char of `query` appears in order in `target` (case-insensitive). */
+export function fuzzyMatches(target: string, query: string): boolean {
+	const t = target.toLowerCase();
+	const q = query.toLowerCase();
+	let ti = 0;
+	for (let qi = 0; qi < q.length; qi++) {
+		const found = t.indexOf(q[qi], ti);
+		if (found < 0) return false;
+		ti = found + 1;
+	}
+	return true;
+}
+
 export function shouldStripImages(config: VisionConfig, modelInput: readonly string[] | undefined): boolean {
 	if (config.mode === "off") return false;
 	if (config.mode === "always") return true;

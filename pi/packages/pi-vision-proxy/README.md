@@ -26,13 +26,22 @@ Settings persist across sessions in `~/.pi/agent/vision-proxy.json`. Environment
 
 ```
 /vision-proxy                                  → opens config menu
+/vision-proxy pick                             → pick vision model (provider → model)
+/vision-proxy model anthropic/claude-sonnet-4-5  → change vision model (raw id)
 /vision-proxy fallback | always | off          → set mode
-/vision-proxy model anthropic/claude-sonnet-4-5  → change vision model
 /vision-proxy context on | off                 → include / exclude recent chat in proxy prompt
 /vision-proxy consent yes | no                 → grant or revoke first-use data-egress consent
 ```
 
-Settings are persisted as session entries and survive restarts.
+Settings are persisted across sessions in `~/.pi/agent/vision-proxy.json`.
+
+### Model picker
+
+`/vision-proxy pick` opens a two-step picker:
+
+1. **Model list** — shows models for the current provider (marked ★). The previously used provider is pre-selected so you land directly on its model list.
+2. **`← Change provider`** — first item in the list, opens the full provider picker to switch.
+3. **`🔍 Type to filter models…`** — appears when a provider has more than 8 models. Opens a text input for fuzzy search (characters in order, case-insensitive — e.g. `cs4` → `Claude Sonnet 4.5`). A single match is auto-selected.
 
 ### Environment variables (override persisted settings)
 

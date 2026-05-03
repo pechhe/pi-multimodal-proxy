@@ -22,6 +22,7 @@ import {
 	extractCandidateImagePaths,
 	fenceUntrusted,
 	findDescriptions,
+	fuzzyMatches,
 	hasConsent,
 	hashImageData,
 	IMAGE_PATH_PLACEHOLDER,
@@ -634,5 +635,37 @@ describe("resolveConfig with fileConfig", () => {
 		assert.equal(cfg.modelId, DEFAULT_CONFIG.modelId);
 		assert.equal(cfg.systemPrompt, DEFAULT_CONFIG.systemPrompt);
 		assert.equal(cfg.includeContext, DEFAULT_CONFIG.includeContext);
+	});
+});
+
+describe("fuzzyMatches", () => {
+	it("matches when all query chars appear in order", () => {
+		assert.equal(fuzzyMatches("Claude Sonnet 4.5", "cs4"), true);
+		assert.equal(fuzzyMatches("Claude Opus 4.6", "op46"), true);
+		assert.equal(fuzzyMatches("GPT-5.4 Pro", "g54"), true);
+	});
+
+	it("is case-insensitive", () => {
+		assert.equal(fuzzyMatches("Claude Sonnet", "CLAUDE"), true);
+		assert.equal(fuzzyMatches("gpt-4o", "GPT4O"), true);
+	});
+
+	it("rejects when chars are out of order or missing", () => {
+		assert.equal(fuzzyMatches("Claude Sonnet 4.5", "4cs"), false);
+		assert.equal(fuzzyMatches("GPT-5", "xyz"), false);
+		assert.equal(fuzzyMatches("Gemini", "gpt"), false);
+	});
+
+	it("matches empty query against anything", () => {
+		assert.equal(fuzzyMatches("anything", ""), true);
+	});
+
+	it("matches exact string", () => {
+		assert.equal(fuzzyMatches("Claude Sonnet 4.5", "Claude Sonnet 4.5"), true);
+	});
+
+	it("matches partial name", () => {
+		assert.equal(fuzzyMatches("Claude Opus 4.6 (EU)", "opus eu"), true);
+		assert.equal(fuzzyMatches("Nova Premier", "nova"), true);
 	});
 });

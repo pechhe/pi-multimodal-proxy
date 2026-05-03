@@ -44,6 +44,7 @@ import {
 	extractCandidateImagePaths,
 	fenceUntrusted,
 	findDescriptions,
+	fuzzyMatches,
 	hasConsent,
 	hashImageData,
 	type LegacyImage,
@@ -64,6 +65,166 @@ import {
 	type VisionConfig,
 	writePersistentFile,
 } from "./internal.js";
+
+/** Two-step vision model picker: choose provider first, then model. */
+async function pickVisionModel(
+	ctx: ExtensionContext,
+	persisted: VisionConfig,
+	writePersisted: (next: VisionConfig) => VisionConfig,
+	envModel: boolean,
+): Promise<void> {
+	if (envModel) {
+		ctx.ui.notify(
+			"[vision-proxy] PI_VISION_PROXY_MODEL is set — env overrides commands. Unset to change.",
+			"warning",
+		);
+		return;
+	}
+	if (!ctx.hasUI) {
+		ctx.ui.notify(
+			"[vision-proxy] Pick needs UI. Use /vision-proxy model provider/id.",
+			"warning",
+		);
+		return;
+	}
+	const vision = ctx.modelRegistry.getAll().filter((m) => m.input.includes("image"));
+	if (vision.length === 0) {
+		ctx.ui.notify("[vision-proxy] No vision-capable models in registry.", "error");
+		return;
+	}
+
+	const currentProvider = persisted.provider;
+
+	// Build sorted provider list: current provider first (★), then alphabetical
+	const providerSet = [...new Set(vision.map((m) => m.provider))];
+	providerSet.sort((a, b) => {
+		if (a === currentProvider && b !== currentProvider) return -1;
+		if (b === currentProvider && a !== currentProvider) return 1;
+		return a.localeCompare(b);
+	});
+
+	// Build provider display items
+	const providerItems = providerSet.map((p) => {
+		const count = vision.filter((m) => m.provider === p).length;
+		const star = p === currentProvider ? " ★" : "";
+		return `${p}${star}  (${count} model${count !== 1 ? "s" : ""})`;
+	});
+
+	// Skip provider step if only 1 provider — go straight to model list
+	let providerPicked: string;
+	if (providerSet.length === 1) {
+		providerPicked = providerSet[0];
+	} else {
+		// Start directly at the model list for the current (★) provider
+		// User can navigate back to pick a different provider
+		providerPicked = currentProvider;
+	}
+
+	// Provider selection loop — re-enters when user picks "← Change provider"
+	// eslint-disable-next-line no-constant-condition
+	while (true) {
+		// Step 2: pick model within provider (with filter support)
+		const models = vision.filter((m) => m.provider === providerPicked);
+		const labelWidth = Math.min(
+			40,
+			Math.max(...models.map((m) => (m.name ?? m.id).length)),
+		);
+
+		const FILTER_OPTION = "🔍 Type to filter models…";
+		const CHANGE_PROVIDER_OPTION = "← Change provider";
+
+		// Build the base model list (without control options)
+		const buildModelItems = (): string[] =>
+			models.map(
+				(m) => `${(m.name ?? m.id).padEnd(labelWidth)}  [${m.provider}]`,
+			);
+
+		// eslint-disable-next-line no-constant-condition
+		while (true) {
+			const baseItems = buildModelItems();
+			const items: string[] = [];
+			if (providerSet.length > 1) items.push(CHANGE_PROVIDER_OPTION);
+			if (baseItems.length > 8) items.push(FILTER_OPTION);
+			items.push(...baseItems);
+
+			const picked = await ctx.ui.select(
+				`Pick vision model (${providerPicked})`,
+				items,
+			);
+			if (!picked) return; // cancelled
+
+			// Handle control options
+			if (picked === CHANGE_PROVIDER_OPTION) {
+				const selected = await ctx.ui.select("Pick provider", providerItems);
+				if (!selected) continue; // cancelled — back to model list
+				const idx = providerItems.indexOf(selected);
+				if (idx < 0) continue;
+				providerPicked = providerSet[idx];
+				break; // restart model list for new provider
+			}
+
+			if (picked === FILTER_OPTION) {
+				const query = await ctx.ui.input(
+					"Filter models",
+				"Type part of a model name…",
+			);
+				if (!query) continue; // cancelled or empty — back to full list
+				const filtered = models.filter((m) =>
+					fuzzyMatches(m.name ?? m.id, query),
+				);
+				if (filtered.length === 0) {
+					ctx.ui.notify(`[vision-proxy] No models match "${query}".`, "warning");
+					continue;
+				}
+				if (filtered.length === 1) {
+					// Single match — select it immediately
+					const m = filtered[0];
+					const next = writePersisted({ ...persisted, provider: m.provider, modelId: m.id });
+					ctx.ui.notify(
+						`Vision proxy model: ${friendlyModelLabel(next, ctx.modelRegistry)}`,
+						"info",
+					);
+					return;
+				}
+				// Show filtered selection (no control options — pure pick)
+				const fLabelWidth = Math.min(
+					40,
+					Math.max(...filtered.map((m) => (m.name ?? m.id).length)),
+				);
+				const fItems = filtered.map(
+					(m) => `${(m.name ?? m.id).padEnd(fLabelWidth)}  [${m.provider}]`,
+				);
+				const fPicked = await ctx.ui.select(
+					`Filter: "${query}" (${filtered.length} matches)`,
+					fItems,
+				);
+				if (!fPicked) continue; // cancelled — back to full list
+				const fIdx = fItems.indexOf(fPicked);
+				if (fIdx < 0) continue;
+				const m = filtered[fIdx];
+				const next = writePersisted({ ...persisted, provider: m.provider, modelId: m.id });
+				ctx.ui.notify(
+					`Vision proxy model: ${friendlyModelLabel(next, ctx.modelRegistry)}`,
+					"info",
+				);
+				return;
+			}
+
+			// Normal model selection
+			const baseIdx = picked === FILTER_OPTION || picked === CHANGE_PROVIDER_OPTION
+				? -1
+				: baseItems.indexOf(picked);
+			if (baseIdx < 0) continue;
+			const m = models[baseIdx];
+			const next = writePersisted({ ...persisted, provider: m.provider, modelId: m.id });
+			ctx.ui.notify(
+				`Vision proxy model: ${friendlyModelLabel(next, ctx.modelRegistry)}`,
+				"info",
+			);
+			return;
+		}
+	}
+}
 
 function shouldStripImages(config: VisionConfig, model: ExtensionContext["model"]): boolean {
 	return shouldStripImagesPure(config, model?.input);
@@ -450,37 +611,7 @@ export default function (pi: ExtensionAPI) {
 
 			// ── Pick from vision-capable registry ───────────────
 			if (sub === "pick") {
-				if (env.model) {
-					ctx.ui.notify(
-						"[vision-proxy] PI_VISION_PROXY_MODEL is set — env overrides commands. Unset to change.",
-						"warning",
-					);
-					return;
-				}
-				if (!ctx.hasUI) {
-					ctx.ui.notify(
-						"[vision-proxy] /vision-proxy pick needs UI. Use /vision-proxy model provider/id.",
-						"warning",
-					);
-					return;
-				}
-				const vision = ctx.modelRegistry.getAll().filter((m) => m.input.includes("image"));
-				if (vision.length === 0) {
-					ctx.ui.notify("[vision-proxy] No vision-capable models in registry.", "error");
-					return;
-				}
-				const labelWidth = Math.min(40, Math.max(...vision.map((m) => (m.name ?? m.id).length)));
-				const items = vision.map((m) => `${(m.name ?? m.id).padEnd(labelWidth)}  [${m.provider}]`);
-				const picked = await ctx.ui.select("Pick vision model", items);
-				if (!picked) return;
-				const idx = items.indexOf(picked);
-				if (idx < 0) return;
-				const m = vision[idx];
-				const next = writePersisted({ ...persisted, provider: m.provider, modelId: m.id });
-				ctx.ui.notify(
-					`Vision proxy model: ${friendlyModelLabel(next, ctx.modelRegistry)}`,
-					"info",
-				);
+				await pickVisionModel(ctx, persisted, writePersisted, !!env.model);
 				return;
 			}
 
@@ -599,34 +730,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (choice.startsWith("Model:")) {
-				if (env.model) {
-					ctx.ui.notify("[vision-proxy] Env override active for model.", "warning");
-					return;
-				}
-				const vision = ctx.modelRegistry
-					.getAll()
-					.filter((m) => m.input.includes("image"));
-				if (vision.length === 0) {
-					ctx.ui.notify("[vision-proxy] No vision-capable models in registry.", "error");
-					return;
-				}
-				const labelWidth = Math.min(
-					40,
-					Math.max(...vision.map((m) => (m.name ?? m.id).length)),
-				);
-				const items = vision.map(
-					(m) => `${(m.name ?? m.id).padEnd(labelWidth)}  [${m.provider}]`,
-				);
-				const picked = await ctx.ui.select("Pick vision model", items);
-				if (!picked) return;
-				const idx = items.indexOf(picked);
-				if (idx < 0) return;
-				const m = vision[idx];
-				const next = writePersisted({ ...persisted, provider: m.provider, modelId: m.id });
-				ctx.ui.notify(
-					`Model set to: ${friendlyModelLabel(next, ctx.modelRegistry)}`,
-					"info",
-				);
+				await pickVisionModel(ctx, persisted, writePersisted, !!env.model);
 				return;
 			}
 
