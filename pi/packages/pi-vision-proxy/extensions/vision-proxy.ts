@@ -92,6 +92,7 @@ import {
 	resolveConfig,
 	resolveCropEntry,
 	sanitize,
+	sanitizeForLog,
 	shouldStripImages as shouldStripImagesPure,
 	splitSubcommand,
 	stripImagePaths,
@@ -169,6 +170,12 @@ const TOOL_DESCRIPTION = [
 // ── Tool result cache (shared across calls in the session) ─────────────────
 
 const _toolCache = new LRUCache<string, string>(50);
+
+/** Maximum analyze_image tool calls per agent turn. Prevents cost runaway. */
+const MAX_TOOL_CALLS_PER_TURN = 10;
+
+/** Current turn's tool call count (reset on each before_agent_start). */
+let _toolCallCount = 0;
 
 /** Sanitize text for embedding inside XML-like tags. */
 function sanitizeXml(text: string): string {
@@ -638,8 +645,8 @@ async function handleAnalyzeImage(
 			images: orderedHashes,
 			cropForm: crops?.length ? (crops[0].region ? "region" : crops[0].normalized ? "normalized" : "pixels") : "none",
 			cropApplied: false,
-			question: question.slice(0, 200),
-			reason: reason ? reason.slice(0, 200) : undefined,
+			question: sanitizeForLog(question),
+			reason: reason ? sanitizeForLog(reason) : undefined,
 			model: `${visionProvider}/${visionModelId}`,
 			latencyMs: 0,
 			cacheHit: true,
@@ -768,8 +775,8 @@ async function handleAnalyzeImage(
 			images: orderedHashes,
 			cropForm: crops?.length ? (crops[0].region ? "region" : crops[0].normalized ? "normalized" : "pixels") : "none",
 			cropApplied: anyCropApplied,
-			question: question.slice(0, 200),
-			reason: reason ? reason.slice(0, 200) : undefined,
+			question: sanitizeForLog(question),
+			reason: reason ? sanitizeForLog(reason) : undefined,
 			model: `${visionProvider}/${visionModelId}`,
 			latencyMs,
 			cacheHit: false,
@@ -811,6 +818,12 @@ export default function (pi: ExtensionAPI) {
 						return { content: [{ type: "text" as const, text: "Error: analyze_image tool is currently disabled. Use /vision-proxy tool on to enable." }] };
 					}
 
+					// Rate limit per turn
+					_toolCallCount++;
+					if (_toolCallCount > MAX_TOOL_CALLS_PER_TURN) {
+						return { content: [{ type: "text" as const, text: `Error: analyze_image call limit reached (${MAX_TOOL_CALLS_PER_TURN} per turn). Rephrase your question or try in the next turn.` }] };
+					}
+
 					// Sync cache size with current config
 					if (_toolCache.maxSize !== config.cacheSize) {
 						_toolCache.resize(config.cacheSize);
@@ -831,6 +844,7 @@ export default function (pi: ExtensionAPI) {
 		// Clear per-session state from previous sessions
 		_imageMeta.clear();
 		_toolCache.clear();
+		_toolCallCount = 0;
 
 		_fileConfig = await readPersistentFile();
 		const config = resolveConfig(ctx.sessionManager.getEntries(), process.env, _fileConfig);
@@ -1583,7 +1597,7 @@ export default function (pi: ExtensionAPI) {
 					pi.appendEntry(CUSTOM_TYPE_COMMAND, {
 						command: sub,
 						images: imagePayloads.map((p) => p.hash),
-						question: question.slice(0, 200),
+						question: sanitizeForLog(question),
 						save: parsed.save,
 						model: `${descConfig.provider}/${descConfig.modelId}`,
 						latencyMs,

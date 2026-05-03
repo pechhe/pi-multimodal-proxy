@@ -54,6 +54,9 @@ export interface ImageMeta {
 /** In-memory map: image hash → dimensions + filename. Populated on first ingestion. */
 export const _imageMeta = new Map<string, ImageMeta>();
 
+/** Maximum pixel dimension for decoded images. Prevents decode bombs (e.g., 10 MB PNG → 500 MB bitmap). */
+const MAX_IMAGE_DIMENSION = 16384; // 16K × 16K ≈ 1 billion pixels max
+
 /** Maximum entries in _imageMeta to prevent unbounded memory growth. */
 const IMAGE_META_MAX = 500;
 
@@ -392,12 +395,25 @@ export function getPersistentConfigPath(agentDir?: string): string {
 	return join(base, "vision-proxy.json");
 }
 
+const PERSISTED_CONFIG_KEYS = new Set([
+	"mode", "provider", "modelId", "systemPrompt", "includeContext",
+	"tool", "maxImagesPerCall", "maxBatch", "cacheSize",
+	"pHashSimilarityThreshold", "groundingModels",
+]);
+
 /** Read config from the persistent file. Returns empty object on any failure. */
 export async function readPersistentFile(agentDir?: string): Promise<Partial<VisionConfig>> {
 	try {
 		const raw = await readFile(getPersistentConfigPath(agentDir), "utf8");
 		const parsed = JSON.parse(raw);
-		if (parsed && typeof parsed === "object") return parsed as Partial<VisionConfig>;
+		if (parsed && typeof parsed === "object") {
+			// Filter to known keys only — prevents prototype pollution or unexpected properties
+			const filtered: Record<string, unknown> = {};
+			for (const [k, v] of Object.entries(parsed)) {
+				if (PERSISTED_CONFIG_KEYS.has(k)) filtered[k] = v;
+			}
+			return filtered as Partial<VisionConfig>;
+		}
 	} catch {
 		// file doesn't exist or is invalid — that's fine
 	}
@@ -782,7 +798,12 @@ export function fenceUntrusted(text: string): string {
 
 /** Escape a string for safe interpolation inside an XML/HTML double-quoted attribute. */
 export function escapeAttr(s: string): string {
-	return s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+	return s
+		.replace(/\0/g, "\uFFFD") // neutralise null bytes
+		.replace(/&/g, "&amp;")
+		.replace(/"/g, "&quot;")
+		.replace(/</g, "&lt;")
+		.replace(/>/g, "&gt;");
 }
 
 // ── Conversation context ──────────────────────────────────────────────────
@@ -888,6 +909,17 @@ export function extractDimensions(data: Buffer): { width: number; height: number
  * Accepts a Buffer directly to avoid re-decoding base64 when the raw bytes
  * are already available (e.g. from readImageFileWithReason).
  */
+/**
+ * Check if image dimensions exceed the decode bomb threshold.
+ * Returns the dims if safe, or undefined if too large.
+ */
+function safeDimensions(data: Buffer): { width: number; height: number } | undefined {
+	const dims = extractDimensions(data);
+	if (!dims) return undefined;
+	if (dims.width > MAX_IMAGE_DIMENSION || dims.height > MAX_IMAGE_DIMENSION) return undefined;
+	return dims;
+}
+
 export function storeImageMeta(hash: string, imageBufferOrData: Buffer | string, filename?: string): void {
 	if (_imageMeta.has(hash)) return;
 	// Avoid full base64 re-decode when a Buffer was already produced by readFile
@@ -901,7 +933,7 @@ export function storeImageMeta(hash: string, imageBufferOrData: Buffer | string,
 		const aligned = headerB64.length - (headerB64.length % 4);
 		buf = Buffer.from(headerB64.slice(0, aligned || 4), "base64");
 	}
-	const dims = extractDimensions(buf);
+	const dims = safeDimensions(buf);
 	if (dims) {
 		_imageMeta.set(hash, { width: dims.width, height: dims.height, filename });
 		evictImageMeta();
@@ -1002,6 +1034,20 @@ export function resolveCropEntry(crop: CropEntry, imgWidth: number, imgHeight: n
 	throw new Error("Invalid CropEntry: must have exactly one of region, normalized, or pixels");
 }
 
+/** Maximum length for telemetry fields stored in session entries. */
+export const TELEMETRY_MAX_LEN = 200;
+
+/** Characters considered unsafe in telemetry log fields. */
+const TELEMETRY_UNSAFE_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g;
+
+/**
+ * Sanitize a string for inclusion in session entry telemetry fields.
+ * Strips control characters, enforces length limit.
+ */
+export function sanitizeForLog(s: string, maxLen = TELEMETRY_MAX_LEN): string {
+	return s.replace(TELEMETRY_UNSAFE_RE, "").slice(0, maxLen);
+}
+
 /**
  * Build a stable crop signature string for cache keys.
  */
@@ -1025,7 +1071,16 @@ export async function cropImage(
 	mimeType?: string,
 ): Promise<Buffer | null> {
 	try {
+		// Decode-bomb protection: check dimensions before full decode
+		const dims = extractDimensions(imageBytes);
+		if (dims && (dims.width > MAX_IMAGE_DIMENSION || dims.height > MAX_IMAGE_DIMENSION)) {
+			return null;
+		}
 		const img = await Image.decode(new Uint8Array(imageBytes));
+		// Double-check decoded dimensions (image-size is header-only, actual may differ)
+		if (img.width > MAX_IMAGE_DIMENSION || img.height > MAX_IMAGE_DIMENSION) {
+			return null;
+		}
 		const cropped = img.crop(crop.x, crop.y, crop.width, crop.height);
 		// Encode back to the same format
 		let encoded: Uint8Array;

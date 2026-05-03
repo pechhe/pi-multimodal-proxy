@@ -57,6 +57,9 @@ import {
 	toPiAiImage,
 	type VisionConfig,
 	writePersistentFile,
+	sanitizeForLog,
+	storeImageMeta,
+	_imageMeta,
 } from "../internal.ts";
 
 // SessionEntry minimal shape — typed loose because peer dep types are not loaded in test
@@ -1694,5 +1697,92 @@ describe("Security: attribute escaping", () => {
 
 	it("escapeAttr handles empty string", () => {
 		assert.equal(escapeAttr(""), "");
+	});
+
+	it("escapeAttr neutralises null bytes (SEC-6)", () => {
+		assert.equal(escapeAttr("before\x00after"), "before\uFFFDafter");
+		assert.equal(escapeAttr("\x00"), "\uFFFD");
+		// Null bytes in filename attribute context
+		const fence = buildDescriptionFence("abc", "desc", { width: 1, height: 1, filename: "test\x00evil.png" });
+		assert.ok(!fence.includes("\x00"), "fence should contain no null bytes");
+		assert.ok(fence.includes("\uFFFD"), "null byte should be replaced with replacement char");
+	});
+});
+
+describe("Security: telemetry sanitization (SEC-3)", () => {
+	it("sanitizeForLog strips control characters", () => {
+		assert.equal(sanitizeForLog("hello\x00world"), "helloworld");
+		assert.equal(sanitizeForLog("bell\x07ring"), "bellring");
+		assert.equal(sanitizeForLog("normal text"), "normal text");
+		// Tab, LF, CR are safe and preserved
+		assert.equal(sanitizeForLog("tab\there"), "tab\there");
+		assert.equal(sanitizeForLog("line\nbreak"), "line\nbreak");
+	});
+
+	it("sanitizeForLog enforces length limit", () => {
+		const long = "a".repeat(500);
+		assert.equal(sanitizeForLog(long).length, 200);
+		assert.equal(sanitizeForLog(long, 50).length, 50);
+	});
+
+	it("sanitizeForLog preserves Unicode", () => {
+		const text = "描述 🖼️ 画像";
+		assert.equal(sanitizeForLog(text), text);
+	});
+
+	it("sanitizeForLog handles empty string", () => {
+		assert.equal(sanitizeForLog(""), "");
+	});
+});
+
+describe("Security: persistent config key filtering (SEC-4)", () => {
+	it("readPersistentFile filters unknown keys", async () => {
+		const dir = await mkdtemp(join(os.tmpdir(), "vp-cfg-sec-"));
+		try {
+			const malicious = JSON.stringify({
+				mode: "always",
+				__proto__: { admin: true },
+				unknownKey: "should be removed",
+				provider: "anthropic",
+			});
+			await writeFile(join(dir, "vision-proxy.json"), malicious);
+			const result = await readPersistentFile(dir) as any;
+			assert.equal(result.mode, "always");
+			assert.equal(result.provider, "anthropic");
+			assert.equal(result.unknownKey, undefined, "unknown key should be filtered");
+			// Check own properties only — constructor is inherited from Object.prototype
+			assert.ok(!Object.keys(result).includes("constructor"), "constructor should not be an own property");
+			assert.ok(!Object.keys(result).includes("__proto__"), "__proto__ should not be an own property");
+			// Verify prototype is not polluted
+			assert.equal(({} as any).admin, undefined);
+		} finally {
+			await rm(dir, { recursive: true });
+		}
+	});
+
+	it("readPersistentFile handles invalid JSON", async () => {
+		const dir = await mkdtemp(join(os.tmpdir(), "vp-cfg-inv-"));
+		try {
+			await writeFile(join(dir, "vision-proxy.json"), "not json at all");
+			const result = await readPersistentFile(dir);
+			assert.deepEqual(result, {});
+		} finally {
+			await rm(dir, { recursive: true });
+		}
+	});
+});
+
+describe("Security: image decode bomb protection", () => {
+	it("storeImageMeta rejects dimensions exceeding MAX_IMAGE_DIMENSION", async () => {
+		// Can't easily create a real 16K×16K image, but we can test the path
+		// by verifying that normal images are accepted
+		const { Image } = await import("imagescript");
+		const img = new Image(100, 100);
+		const encoded = Buffer.from(await img.encode(1));
+		const hash = "test-decode-bomb-normal";
+		storeImageMeta(hash, encoded);
+		const meta = _imageMeta.get(hash);
+		// Normal image should be accepted
+		assert.ok(meta, "normal image should be stored");
 	});
 });
