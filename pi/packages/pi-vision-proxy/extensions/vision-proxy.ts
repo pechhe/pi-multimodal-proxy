@@ -854,6 +854,7 @@ export default function (pi: ExtensionAPI) {
 			const filePaths = extractCandidateImagePaths(event.prompt);
 			const acceptedPaths: string[] = [];
 			for (const fp of filePaths) {
+				if (fp.includes("..")) continue; // defense-in-depth: reject traversal
 				const r = await readImageFileWithReason(fp);
 				if (r.image) {
 					images.push(r.image);
@@ -1731,7 +1732,7 @@ export default function (pi: ExtensionAPI) {
 
 			if (choice.startsWith("Consent")) {
 				const granted = !hasConsent(entries);
-				pi.appendEntry<ConsentEntry>(CUSTOM_TYPE_CONSENT, { granted });
+				pi.appendEntry<ConsentEntry>(CUSTOM_TYPE_CONSENT, { granted, provider: effective.provider });
 				ctx.ui.notify(`Consent: ${granted ? "granted" : "revoked"}`, granted ? "info" : "warning");
 				return;
 			}
