@@ -11,12 +11,19 @@ import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 import { mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
-import { join } from "node:path";
+import { join, parse } from "node:path";
 import {
 	buildConversationContext,
 	buildDescriptionFence,
 	buildAnalysisFence,
+	buildVideoDescriptionFence,
+	buildVideoEmptyResponseError,
+	buildVideoProxySection,
 	clampPixels,
+	extractXaiResponsesText,
+	formatXaiSttTranscript,
+	isTranscriptionRequest,
+	isXaiProvider,
 	CUSTOM_TYPE_CONFIG,
 	CUSTOM_TYPE_CONSENT,
 	CUSTOM_TYPE_DESCRIPTION,
@@ -25,6 +32,8 @@ import {
 	envFlags,
 	escapeAttr,
 	extractCandidateImagePaths,
+	extractCandidateVideoPaths,
+	extractCandidateAudioPaths,
 	extractDimensions,
 	fenceUntrusted,
 	findDescriptions,
@@ -33,6 +42,7 @@ import {
 	hasConsent,
 	hashImageData,
 	IMAGE_PATH_PLACEHOLDER,
+	VIDEO_PATH_PLACEHOLDER,
 	isPathAllowed,
 	isValidNamedRegion,
 	LRUCache,
@@ -54,6 +64,7 @@ import {
 	shouldStripImages,
 	splitSubcommand,
 	stripImagePaths,
+	stripMediaPaths,
 	toPiAiImage,
 	type VisionConfig,
 	writePersistentFile,
@@ -89,6 +100,17 @@ describe("parseModelString", () => {
 		});
 	});
 
+	it("normalizes legacy x-ai provider id to Pi's xai provider", () => {
+		assert.deepEqual(parseModelString("x-ai/grok-4.3"), {
+			provider: "xai",
+			modelId: "grok-4.3",
+		});
+		assert.deepEqual(parseModelString("xai/grok-4.3"), {
+			provider: "xai",
+			modelId: "grok-4.3",
+		});
+	});
+
 	it("rejects malformed strings", () => {
 		assert.equal(parseModelString(""), null);
 		assert.equal(parseModelString("/foo"), null);
@@ -113,6 +135,12 @@ describe("sanitize", () => {
 		assert.equal(out.modelId, DEFAULT_CONFIG.modelId);
 		assert.equal(out.systemPrompt, DEFAULT_CONFIG.systemPrompt);
 		assert.equal(out.includeContext, DEFAULT_CONFIG.includeContext);
+	});
+
+	it("normalizes legacy x-ai provider id in config", () => {
+		const result = sanitize({ ...DEFAULT_CONFIG, provider: "x-ai", videoProvider: "x-ai" });
+		assert.equal(result.provider, "xai");
+		assert.equal(result.videoProvider, "xai");
 	});
 
 	it("preserves valid values", () => {
@@ -161,6 +189,12 @@ describe("readEnvOverrides", () => {
 		const out = readEnvOverrides({ PI_VISION_PROXY_MODEL: "openai/gpt-4o" });
 		assert.equal(out.provider, "openai");
 		assert.equal(out.modelId, "gpt-4o");
+	});
+
+	it("normalizes legacy x-ai video model env override", () => {
+		const out = readEnvOverrides({ PI_VISION_PROXY_VIDEO_MODEL: "x-ai/grok-4.3" });
+		assert.equal(out.videoProvider, "xai");
+		assert.equal(out.videoModelId, "grok-4.3");
 	});
 
 	it("ignores malformed model string", () => {
@@ -469,6 +503,46 @@ describe("extractCandidateImagePaths", () => {
 	});
 });
 
+describe("extractCandidateMediaPaths", () => {
+	it("detects quoted Windows video paths with spaces", () => {
+		const input = `video is not working: "D:\\Downloads\\Rethinking Agents - Harness is All you Need_.mp4" transcribe this`;
+		assert.deepEqual(extractCandidateVideoPaths(input), [
+			"D:\\Downloads\\Rethinking Agents - Harness is All you Need_.mp4",
+		]);
+	});
+
+	it("detects unquoted video paths without spaces", () => {
+		assert.deepEqual(extractCandidateVideoPaths("see D:\\Downloads\\clip.mp4 now"), ["D:\\Downloads\\clip.mp4"]);
+		assert.deepEqual(extractCandidateVideoPaths("see ./clip.mkv now"), ["./clip.mkv"]);
+	});
+
+	it("detects unquoted Windows video paths with spaces", () => {
+		const input = "Transcribe this video with timestamps D:\\Downloads\\Rethinking Agents - Harness is All you Need_.mp4";
+		assert.deepEqual(extractCandidateVideoPaths(input), [
+			"D:\\Downloads\\Rethinking Agents - Harness is All you Need_.mp4",
+		]);
+	});
+
+	it("detects quoted relative paths and audio paths with spaces", () => {
+		assert.deepEqual(extractCandidateVideoPaths(`see "./my video.mp4" now`), ["./my video.mp4"]);
+		assert.deepEqual(extractCandidateAudioPaths(`listen "C:\\Users\\Me\\Audio File.m4a" please`), [
+			"C:\\Users\\Me\\Audio File.m4a",
+		]);
+	});
+
+	it("does not treat unquoted paths with spaces as a single path", () => {
+		assert.deepEqual(extractCandidateVideoPaths("see ./my video.mp4 now"), []);
+	});
+});
+
+describe("stripMediaPaths", () => {
+	it("replaces media paths with placeholder", () => {
+		const mediaPath = "D:\\Downloads\\Rethinking Agents - Harness is All you Need_.mp4";
+		const result = stripMediaPaths(`transcribe "${mediaPath}" please`, [mediaPath]);
+		assert.equal(result, `transcribe "${VIDEO_PATH_PLACEHOLDER}" please`);
+	});
+});
+
 describe("stripImagePaths", () => {
 	it("replaces a single path with placeholder", () => {
 		const result = stripImagePaths("see /tmp/pi-clipboard-abc.png here", ["/tmp/pi-clipboard-abc.png"]);
@@ -521,25 +595,53 @@ describe("isPathAllowed", () => {
 		assert.equal(await isPathAllowed(join(os.tmpdir(), "does-not-exist-xyz.png")), false);
 	});
 
-	it("denies homedir files unless PI_VISION_PROXY_ALLOW_HOME=1", async () => {
-		// Use tmpdir as a stand-in we can write to; flip env to simulate the gate.
-		// We resolve a path that is neither under cwd nor tmp by asserting the env behaviour
-		// indirectly: with the flag set, an existing tmp file is still allowed (tmp wins);
-		// without it, that's also true. So we test the env path explicitly with realpath of
-		// homedir itself, which is a real, resolvable directory outside tmp/cwd.
-		const home = os.homedir();
-		const prev = process.env.PI_VISION_PROXY_ALLOW_HOME;
+	it("allows local Windows drive paths by default", async () => {
+		const root = parse(process.cwd()).root;
+		if (!/^[a-z]:[\\/]/i.test(root)) return;
+		const prevDrives = process.env.PI_VISION_PROXY_ALLOW_DRIVES;
 		try {
+			delete process.env.PI_VISION_PROXY_ALLOW_DRIVES;
+			assert.equal(await isPathAllowed(process.cwd()), true);
+		} finally {
+			if (prevDrives === undefined) delete process.env.PI_VISION_PROXY_ALLOW_DRIVES;
+			else process.env.PI_VISION_PROXY_ALLOW_DRIVES = prevDrives;
+		}
+	});
+
+	it("can disable local Windows drive path access with PI_VISION_PROXY_ALLOW_DRIVES=0", async () => {
+		const root = parse(process.cwd()).root;
+		if (!/^[a-z]:[\\/]/i.test(root)) return;
+		const prevDrives = process.env.PI_VISION_PROXY_ALLOW_DRIVES;
+		try {
+			process.env.PI_VISION_PROXY_ALLOW_DRIVES = "0";
+			// cwd is still allowed by the cwd rule, so assert using the user home when it is outside cwd.
+			const home = os.homedir();
+			if (!home.toLowerCase().startsWith(process.cwd().toLowerCase())) {
+				assert.equal(await isPathAllowed(home), false);
+			}
+		} finally {
+			if (prevDrives === undefined) delete process.env.PI_VISION_PROXY_ALLOW_DRIVES;
+			else process.env.PI_VISION_PROXY_ALLOW_DRIVES = prevDrives;
+		}
+	});
+
+	it("allows homedir files when PI_VISION_PROXY_ALLOW_HOME=1", async () => {
+		const home = os.homedir();
+		const prevHome = process.env.PI_VISION_PROXY_ALLOW_HOME;
+		const prevDrives = process.env.PI_VISION_PROXY_ALLOW_DRIVES;
+		try {
+			process.env.PI_VISION_PROXY_ALLOW_DRIVES = "0";
 			delete process.env.PI_VISION_PROXY_ALLOW_HOME;
-			// homedir() may equal cwd in odd setups; skip the assertion in that case.
 			if (!home.toLowerCase().startsWith(process.cwd().toLowerCase())) {
 				assert.equal(await isPathAllowed(home), false);
 			}
 			process.env.PI_VISION_PROXY_ALLOW_HOME = "1";
 			assert.equal(await isPathAllowed(home), true);
 		} finally {
-			if (prev === undefined) delete process.env.PI_VISION_PROXY_ALLOW_HOME;
-			else process.env.PI_VISION_PROXY_ALLOW_HOME = prev;
+			if (prevHome === undefined) delete process.env.PI_VISION_PROXY_ALLOW_HOME;
+			else process.env.PI_VISION_PROXY_ALLOW_HOME = prevHome;
+			if (prevDrives === undefined) delete process.env.PI_VISION_PROXY_ALLOW_DRIVES;
+			else process.env.PI_VISION_PROXY_ALLOW_DRIVES = prevDrives;
 		}
 	});
 });
@@ -951,6 +1053,82 @@ describe("extractDimensions", () => {
 	it("returns undefined for invalid data", () => {
 		const dims = extractDimensions(Buffer.from("not an image"));
 		assert.equal(dims, undefined);
+	});
+});
+
+describe("buildVideoDescriptionFence", () => {
+	it("builds video fence with file, hash, and mime attributes", () => {
+		const fence = buildVideoDescriptionFence("abc123", "clip.mp4", "video/mp4", "Hello world");
+		assert.ok(fence.includes('file="clip.mp4"'));
+		assert.ok(fence.includes('hash="abc123"'));
+		assert.ok(fence.includes('mime="video/mp4"'));
+		assert.ok(fence.includes("Hello world"));
+	});
+});
+
+describe("buildVideoEmptyResponseError", () => {
+	it("returns actionable guidance for providers that accept video but return no text", () => {
+		const message = buildVideoEmptyResponseError("xai", "grok-4.3");
+		assert.ok(message.includes("empty response from xai/grok-4.3"));
+		assert.ok(message.includes("provider accepted the request but returned no text"));
+		assert.ok(message.includes("native xAI STT or Files/Responses path"));
+		assert.ok(message.includes("shorter clip"));
+		assert.ok(message.includes("smaller/transcoded video"));
+		assert.ok(message.includes("Gemini"));
+	});
+});
+
+describe("xAI native media helpers", () => {
+	it("detects transcription requests", () => {
+		assert.equal(isTranscriptionRequest("Transcribe this video with timestamps"), true);
+		assert.equal(isTranscriptionRequest("make SRT captions"), true);
+		assert.equal(isTranscriptionRequest("summarize visual scenes"), false);
+	});
+
+	it("detects xAI provider aliases", () => {
+		assert.equal(isXaiProvider("xai"), true);
+		assert.equal(isXaiProvider("x-ai"), true);
+		assert.equal(isXaiProvider("google"), false);
+	});
+
+	it("formats xAI STT words into timestamped transcript", () => {
+		const formatted = formatXaiSttTranscript({
+			text: "Hello world.",
+			language: "English",
+			duration: 1.5,
+			words: [
+				{ text: "Hello", start: 0.1, end: 0.5 },
+				{ text: "world.", start: 0.6, end: 1.2 },
+			],
+		}, "clip.mp4");
+		assert.ok(formatted.includes("xAI Speech-to-Text transcription for clip.mp4"));
+		assert.ok(formatted.includes("Detected language: English"));
+		assert.ok(formatted.includes("[00:00"));
+		assert.ok(formatted.includes("Hello world."));
+	});
+
+	it("extracts output text from xAI Responses objects", () => {
+		assert.equal(extractXaiResponsesText({ output_text: "direct" }), "direct");
+		assert.equal(extractXaiResponsesText({ output: [{ type: "message", content: [{ type: "output_text", text: "nested" }] }] }), "nested");
+	});
+});
+
+describe("buildVideoProxySection", () => {
+	it("instructs downstream agents to use injected video analysis instead of local transcription tools", () => {
+		const section = buildVideoProxySection(
+			1,
+			"x-ai",
+			"grok-4.3",
+			buildVideoDescriptionFence("abc123", "clip.mp4", "video/mp4", "[00:00] hello"),
+		);
+		assert.ok(section.includes("already analyzed the media"));
+		assert.ok(section.includes("answer from this injected context"));
+		assert.ok(section.includes("Do not run local media-processing or transcription tools"));
+		assert.ok(section.includes("ffmpeg"));
+		assert.ok(section.includes("Whisper"));
+		assert.ok(section.includes("Python"));
+		assert.ok(section.includes("Only use external/local tools"));
+		assert.ok(section.includes("<vision_proxy_video_description"));
 	});
 });
 
