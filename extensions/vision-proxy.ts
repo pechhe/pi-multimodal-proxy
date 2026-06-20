@@ -132,6 +132,8 @@ import {
 	storeImageData,
 	getImageData,
 	clearImageData,
+	createImageDataStore,
+	type ImageDataStore,
 	parseRecallRef,
 	spinnerFrame,
 	formatProgressStatus,
@@ -224,6 +226,8 @@ interface SessionState {
 	toolCallCount: number;
 	/** Image hash → dimensions/filename, populated on first ingestion this session. */
 	imageMeta: ImageMetaStore;
+	/** Retained image bytes for analyze_image session recall. */
+	imageData: ImageDataStore;
 }
 
 const _sessionState = new WeakMap<object, SessionState>();
@@ -236,6 +240,7 @@ function getSessionState(ctx: ExtensionContext): SessionState {
 			toolCache: new LRUCache<string, string>(DEFAULT_TOOL_CACHE_SIZE),
 			toolCallCount: 0,
 			imageMeta: createImageMetaStore(),
+			imageData: createImageDataStore(),
 		};
 		_sessionState.set(key, state);
 	}
@@ -580,7 +585,7 @@ async function analyzeImages(
 		? `\n\n## Recent conversation (untrusted user dialogue, for grounding only)\n<conversation>\n${conversationContext}\n</conversation>`
 		: "";
 
-	const imageMeta = getSessionState(ctx).imageMeta;
+	const { imageMeta, imageData } = getSessionState(ctx);
 	let completed = 0;
 	const rawTasks = images.map(async (raw, i): Promise<AnalysisResult> => {
 		let piAiImage: PiAiImage;
@@ -594,7 +599,7 @@ async function analyzeImages(
 		// Store image metadata on first encounter
 		storeImageMeta(imageMeta, hash, piAiImage.data);
 		// Retain bytes for later session recall via analyze_image
-		storeImageData(hash, piAiImage.data, piAiImage.mimeType);
+		storeImageData(imageData, hash, piAiImage.data, piAiImage.mimeType);
 
 		try {
 			const response = await complete(
@@ -1073,12 +1078,12 @@ async function handleAnalyzeImage(
 	// Resolve image references to PiAiImage objects.
 	// A reference is either a session-recall handle (the `image="..."` id from a
 	// prior <vision_proxy_description>/<vision_proxy_analysis> block) or a file path.
-	const imageMeta = getSessionState(ctx).imageMeta;
+	const { imageMeta, imageData } = getSessionState(ctx);
 	const resolvedImages: { image: PiAiImage; hash: string; meta?: ImageMeta }[] = [];
 	for (const ref of imageRefs) {
 		const recallHash = parseRecallRef(ref);
 		if (recallHash) {
-			const stored = getImageData(recallHash);
+			const stored = getImageData(imageData, recallHash);
 			if (!stored) {
 				return `Error: image "${recallHash}" is not available for recall — it may have expired from the session cache or was never analyzed. Ask the user to re-attach it, or pass a file path.`;
 			}
@@ -1099,7 +1104,7 @@ async function handleAnalyzeImage(
 		}
 		const hash = hashImageData(r.image.data);
 		storeImageMeta(imageMeta, hash, r.image.data, r.filename);
-		storeImageData(hash, r.image.data, r.image.mimeType);
+		storeImageData(imageData, hash, r.image.data, r.image.mimeType);
 		resolvedImages.push({ image: r.image, hash, meta: imageMeta.get(hash) });
 	}
 
@@ -1349,8 +1354,7 @@ export default function (pi: ExtensionAPI) {
 		state.toolCache.clear();
 		state.toolCallCount = 0;
 		state.imageMeta.clear();
-		// Recall byte cache is a process-global (main); clear it on session start.
-		clearImageData();
+		clearImageData(state.imageData);
 
 		_fileConfig = await readPersistentFile();
 		const config = resolveConfig(ctx.sessionManager.getEntries(), process.env, _fileConfig);
@@ -1370,6 +1374,7 @@ export default function (pi: ExtensionAPI) {
 			const sessionState = getSessionState(ctx);
 			sessionState.toolCallCount = 0;
 			const imageMeta = sessionState.imageMeta;
+			const imageData = sessionState.imageData;
 
 			// Collect images: structured attachments + file paths detected in prompt text
 			const images: (PiAiImage | LegacyImage)[] = [...(event.images ?? [])];
@@ -1384,7 +1389,7 @@ export default function (pi: ExtensionAPI) {
 					// Store metadata
 					const hash = hashImageData(r.image.data);
 					storeImageMeta(imageMeta, hash, r.image.data, r.filename);
-					storeImageData(hash, r.image.data, r.image.mimeType);
+					storeImageData(imageData, hash, r.image.data, r.image.mimeType);
 				} else if (r.reason && r.reason !== "not-an-image") {
 					ctx.ui.notify(
 						`[multimodal-proxy] Skipped ${fp}: ${describeReadReason(r.reason, r.bytes)}`,
@@ -2135,12 +2140,12 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				// Resolve image references to PiAiImage (recall handle or file path)
-				const imageMeta = getSessionState(ctx).imageMeta;
+				const { imageMeta, imageData } = getSessionState(ctx);
 				const resolvedImages: { image: PiAiImage; hash: string; meta?: ImageMeta }[] = [];
 				for (const ref of parsed.images) {
 					const recallHash = parseRecallRef(ref);
 					if (recallHash) {
-						const stored = getImageData(recallHash);
+						const stored = getImageData(imageData, recallHash);
 						if (!stored) {
 							ctx.ui.notify(`[multimodal-proxy] Image "${recallHash}" is not available for recall — it may have expired from the session cache or was never analyzed.`, "error");
 							return;
@@ -2162,7 +2167,7 @@ export default function (pi: ExtensionAPI) {
 					}
 					const hash = hashImageData(r.image.data);
 					storeImageMeta(imageMeta, hash, r.image.data, r.filename);
-					storeImageData(hash, r.image.data, r.image.mimeType);
+					storeImageData(imageData, hash, r.image.data, r.image.mimeType);
 					resolvedImages.push({ image: r.image, hash, meta: imageMeta.get(hash) });
 				}
 

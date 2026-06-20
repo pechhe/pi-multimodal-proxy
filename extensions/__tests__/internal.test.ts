@@ -74,13 +74,12 @@ import {
 	createImageMetaStore,
 	storeImageData,
 	getImageData,
-	clearImageData,
+	createImageDataStore,
 	parseRecallRef,
 	spinnerFrame,
 	formatProgressStatus,
 	SPINNER_FRAMES,
 	RECALL_HINT,
-	_imageData,
 } from "../internal.ts";
 
 // SessionEntry minimal shape — typed loose because peer dep types are not loaded in test
@@ -327,79 +326,81 @@ describe("parseRecallRef", () => {
 
 describe("session image recall store", () => {
 	it("round-trips retained image bytes by hash", () => {
-		clearImageData();
-		storeImageData("hash1", "AAAA", "image/png");
-		const got = getImageData("hash1");
+		const store = createImageDataStore();
+		storeImageData(store, "hash1", "AAAA", "image/png");
+		const got = getImageData(store, "hash1");
 		assert.deepEqual(got, { data: "AAAA", mimeType: "image/png" });
-		assert.equal(getImageData("missing"), undefined);
-		clearImageData();
+		assert.equal(getImageData(store, "missing"), undefined);
 	});
 
 	it("ignores empty hash or data", () => {
-		clearImageData();
-		storeImageData("", "AAAA", "image/png");
-		storeImageData("hash", "", "image/png");
-		assert.equal(_imageData.size, 0);
-		clearImageData();
+		const store = createImageDataStore();
+		storeImageData(store, "", "AAAA", "image/png");
+		storeImageData(store, "hash", "", "image/png");
+		assert.equal(store.map.size, 0);
 	});
 
 	it("does not duplicate on re-store of the same hash", () => {
-		clearImageData();
-		storeImageData("hash1", "AAAA", "image/png");
-		storeImageData("hash1", "AAAA", "image/png");
-		assert.equal(_imageData.size, 1);
-		clearImageData();
+		const store = createImageDataStore();
+		storeImageData(store, "hash1", "AAAA", "image/png");
+		storeImageData(store, "hash1", "AAAA", "image/png");
+		assert.equal(store.map.size, 1);
+	});
+
+	it("keeps stores isolated — one session's bytes do not leak into another (issue #12)", () => {
+		const sessionA = createImageDataStore();
+		const sessionB = createImageDataStore();
+		storeImageData(sessionA, "hash1", "AAAA", "image/png");
+		assert.deepEqual(getImageData(sessionA, "hash1"), { data: "AAAA", mimeType: "image/png" });
+		assert.equal(getImageData(sessionB, "hash1"), undefined);
 	});
 
 	it("evicts least-recently-used entries past the byte budget", () => {
-		clearImageData();
+		const store = createImageDataStore();
 		const prev = process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES;
 		// Budget of 10 decoded bytes; each 8-char base64 entry decodes to 6 bytes.
 		process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES = "10";
 		try {
-			storeImageData("h1", "AAAAAAAA", "image/png"); // 6 decoded bytes, total 6
-			storeImageData("h2", "BBBBBBBB", "image/png"); // 6 decoded bytes, total 12 > 10 → evict h1
-			assert.equal(getImageData("h1"), undefined);
-			assert.deepEqual(getImageData("h2"), { data: "BBBBBBBB", mimeType: "image/png" });
+			storeImageData(store, "h1", "AAAAAAAA", "image/png"); // 6 decoded bytes, total 6
+			storeImageData(store, "h2", "BBBBBBBB", "image/png"); // 6 decoded bytes, total 12 > 10 → evict h1
+			assert.equal(getImageData(store, "h1"), undefined);
+			assert.deepEqual(getImageData(store, "h2"), { data: "BBBBBBBB", mimeType: "image/png" });
 		} finally {
 			if (prev === undefined) delete process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES;
 			else process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES = prev;
-			clearImageData();
 		}
 	});
 
 	it("keeps a single oversized image rather than evicting everything", () => {
-		clearImageData();
+		const store = createImageDataStore();
 		const prev = process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES;
 		process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES = "4";
 		try {
-			storeImageData("big", "AAAAAAAAAAAA", "image/png"); // 9 decoded bytes > 4 budget
-			assert.deepEqual(getImageData("big"), { data: "AAAAAAAAAAAA", mimeType: "image/png" });
-			assert.equal(_imageData.size, 1);
+			storeImageData(store, "big", "AAAAAAAAAAAA", "image/png"); // 9 decoded bytes > 4 budget
+			assert.deepEqual(getImageData(store, "big"), { data: "AAAAAAAAAAAA", mimeType: "image/png" });
+			assert.equal(store.map.size, 1);
 		} finally {
 			if (prev === undefined) delete process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES;
 			else process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES = prev;
-			clearImageData();
 		}
 	});
 
 	it("bumps recency on access so the touched entry survives eviction", () => {
-		clearImageData();
+		const store = createImageDataStore();
 		const prev = process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES;
 		// Budget of 14 decoded bytes; each 8-char base64 entry decodes to 6 bytes.
 		process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES = "14";
 		try {
-			storeImageData("h1", "AAAAAAAA", "image/png"); // 6 decoded bytes, total 6
-			storeImageData("h2", "BBBBBBBB", "image/png"); // 6 decoded bytes, total 12
-			getImageData("h1"); // bump h1 to most-recent
-			storeImageData("h3", "CCCCCCCC", "image/png"); // 6 decoded bytes, total 18 > 14 → evict LRU (h2)
-			assert.deepEqual(getImageData("h1"), { data: "AAAAAAAA", mimeType: "image/png" });
-			assert.equal(getImageData("h2"), undefined);
-			assert.deepEqual(getImageData("h3"), { data: "CCCCCCCC", mimeType: "image/png" });
+			storeImageData(store, "h1", "AAAAAAAA", "image/png"); // 6 decoded bytes, total 6
+			storeImageData(store, "h2", "BBBBBBBB", "image/png"); // 6 decoded bytes, total 12
+			getImageData(store, "h1"); // bump h1 to most-recent
+			storeImageData(store, "h3", "CCCCCCCC", "image/png"); // 6 decoded bytes, total 18 > 14 → evict LRU (h2)
+			assert.deepEqual(getImageData(store, "h1"), { data: "AAAAAAAA", mimeType: "image/png" });
+			assert.equal(getImageData(store, "h2"), undefined);
+			assert.deepEqual(getImageData(store, "h3"), { data: "CCCCCCCC", mimeType: "image/png" });
 		} finally {
 			if (prev === undefined) delete process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES;
 			else process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES = prev;
-			clearImageData();
 		}
 	});
 });

@@ -90,11 +90,21 @@ function evictImageMeta(meta: ImageMetaStore): void {
 // posture intact. Insertion order is used for LRU eviction once the byte budget
 // is exceeded.
 
-/** In-memory map: image hash → retained base64 bytes + mime type, for recall. */
-export const _imageData = new Map<string, { data: string; mimeType: string }>();
+/**
+ * Per-session retained-bytes store for image recall: hash → base64 bytes + mime
+ * type, plus a running total of decoded bytes for budget enforcement. Held per
+ * session (see SessionState in vision-proxy) so retained image bytes never leak
+ * across sessions, mirroring the per-session image-metadata store.
+ */
+export interface ImageDataStore {
+	map: Map<string, { data: string; mimeType: string }>;
+	totalBytes: number;
+}
 
-/** Running total of retained decoded image bytes across _imageData. */
-let _imageDataBytes = 0;
+/** Create an empty per-session image-recall byte store. */
+export function createImageDataStore(): ImageDataStore {
+	return { map: new Map(), totalBytes: 0 };
+}
 
 /** Default byte budget for retained image data (decoded bytes, ≈64 MB). */
 const IMAGE_DATA_MAX_BYTES_DEFAULT = 64 * 1024 * 1024;
@@ -109,49 +119,49 @@ function imageDataMaxBytes(): number {
 	return IMAGE_DATA_MAX_BYTES_DEFAULT;
 }
 
-function evictImageData(): void {
+function evictImageData(store: ImageDataStore): void {
 	const budget = imageDataMaxBytes();
 	// When budget is 0, allow full eviction (recall disabled).
 	// Otherwise keep at least one entry so an oversized image is still recallable.
 	const minRetained = budget === 0 ? 0 : 1;
-	while (_imageDataBytes > budget && _imageData.size > minRetained) {
-		const first = _imageData.keys().next().value;
+	while (store.totalBytes > budget && store.map.size > minRetained) {
+		const first = store.map.keys().next().value;
 		if (first === undefined) break;
-		const v = _imageData.get(first);
-		_imageData.delete(first);
-		if (v) _imageDataBytes -= Buffer.byteLength(v.data, "base64");
+		const v = store.map.get(first);
+		store.map.delete(first);
+		if (v) store.totalBytes -= Buffer.byteLength(v.data, "base64");
 	}
 }
 
 /** Retain an image's bytes for later recall. No-op if already retained (LRU bumped). */
-export function storeImageData(hash: string, data: string, mimeType: string): void {
+export function storeImageData(store: ImageDataStore, hash: string, data: string, mimeType: string): void {
 	if (!hash || !data) return;
-	const existing = _imageData.get(hash);
+	const existing = store.map.get(hash);
 	if (existing) {
 		// Bump recency: re-insert at the end of the iteration order.
-		_imageData.delete(hash);
-		_imageData.set(hash, existing);
+		store.map.delete(hash);
+		store.map.set(hash, existing);
 		return;
 	}
-	_imageData.set(hash, { data, mimeType });
-	_imageDataBytes += Buffer.byteLength(data, "base64");
-	evictImageData();
+	store.map.set(hash, { data, mimeType });
+	store.totalBytes += Buffer.byteLength(data, "base64");
+	evictImageData(store);
 }
 
 /** Fetch retained image bytes by hash, bumping recency. Undefined if not retained. */
-export function getImageData(hash: string): { data: string; mimeType: string } | undefined {
-	const v = _imageData.get(hash);
+export function getImageData(store: ImageDataStore, hash: string): { data: string; mimeType: string } | undefined {
+	const v = store.map.get(hash);
 	if (v) {
-		_imageData.delete(hash);
-		_imageData.set(hash, v);
+		store.map.delete(hash);
+		store.map.set(hash, v);
 	}
 	return v;
 }
 
 /** Test/maintenance helper: drop all retained image bytes. */
-export function clearImageData(): void {
-	_imageData.clear();
-	_imageDataBytes = 0;
+export function clearImageData(store: ImageDataStore): void {
+	store.map.clear();
+	store.totalBytes = 0;
 }
 
 /**
