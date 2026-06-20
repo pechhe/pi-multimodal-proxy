@@ -353,11 +353,11 @@ describe("session image recall store", () => {
 	it("evicts least-recently-used entries past the byte budget", () => {
 		clearImageData();
 		const prev = process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES;
-		// Budget of 10 base64 chars; each entry below is 8 chars.
+		// Budget of 10 decoded bytes; each 8-char base64 entry decodes to 6 bytes.
 		process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES = "10";
 		try {
-			storeImageData("h1", "AAAAAAAA", "image/png"); // 8 bytes, total 8
-			storeImageData("h2", "BBBBBBBB", "image/png"); // 8 bytes, total 16 > 10 → evict h1
+			storeImageData("h1", "AAAAAAAA", "image/png"); // 6 decoded bytes, total 6
+			storeImageData("h2", "BBBBBBBB", "image/png"); // 6 decoded bytes, total 12 > 10 → evict h1
 			assert.equal(getImageData("h1"), undefined);
 			assert.deepEqual(getImageData("h2"), { data: "BBBBBBBB", mimeType: "image/png" });
 		} finally {
@@ -372,7 +372,7 @@ describe("session image recall store", () => {
 		const prev = process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES;
 		process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES = "4";
 		try {
-			storeImageData("big", "AAAAAAAAAAAA", "image/png"); // 12 bytes > 4 budget
+			storeImageData("big", "AAAAAAAAAAAA", "image/png"); // 9 decoded bytes > 4 budget
 			assert.deepEqual(getImageData("big"), { data: "AAAAAAAAAAAA", mimeType: "image/png" });
 			assert.equal(_imageData.size, 1);
 		} finally {
@@ -385,12 +385,13 @@ describe("session image recall store", () => {
 	it("bumps recency on access so the touched entry survives eviction", () => {
 		clearImageData();
 		const prev = process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES;
-		process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES = "20";
+		// Budget of 14 decoded bytes; each 8-char base64 entry decodes to 6 bytes.
+		process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES = "14";
 		try {
-			storeImageData("h1", "AAAAAAAA", "image/png"); // total 8
-			storeImageData("h2", "BBBBBBBB", "image/png"); // total 16
+			storeImageData("h1", "AAAAAAAA", "image/png"); // 6 decoded bytes, total 6
+			storeImageData("h2", "BBBBBBBB", "image/png"); // 6 decoded bytes, total 12
 			getImageData("h1"); // bump h1 to most-recent
-			storeImageData("h3", "CCCCCCCC", "image/png"); // total 24 > 20 → evict LRU (h2)
+			storeImageData("h3", "CCCCCCCC", "image/png"); // 6 decoded bytes, total 18 > 14 → evict LRU (h2)
 			assert.deepEqual(getImageData("h1"), { data: "AAAAAAAA", mimeType: "image/png" });
 			assert.equal(getImageData("h2"), undefined);
 			assert.deepEqual(getImageData("h3"), { data: "CCCCCCCC", mimeType: "image/png" });

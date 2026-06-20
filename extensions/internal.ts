@@ -108,7 +108,7 @@ function evictImageData(): void {
 		if (first === undefined) break;
 		const v = _imageData.get(first);
 		_imageData.delete(first);
-		if (v) _imageDataBytes -= v.data.length;
+		if (v) _imageDataBytes -= Buffer.byteLength(v.data, "base64");
 	}
 }
 
@@ -123,7 +123,7 @@ export function storeImageData(hash: string, data: string, mimeType: string): vo
 		return;
 	}
 	_imageData.set(hash, { data, mimeType });
-	_imageDataBytes += data.length;
+	_imageDataBytes += Buffer.byteLength(data, "base64");
 	evictImageData();
 }
 

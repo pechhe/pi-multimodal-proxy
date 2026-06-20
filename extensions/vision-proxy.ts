@@ -130,6 +130,7 @@ import {
 	storeImageMeta,
 	storeImageData,
 	getImageData,
+	clearImageData,
 	parseRecallRef,
 	spinnerFrame,
 	formatProgressStatus,
@@ -1307,6 +1308,7 @@ export default function (pi: ExtensionAPI) {
 		// Clear per-session state from previous sessions
 		_imageMeta.clear();
 		_toolCache.clear();
+		clearImageData();
 
 		_fileConfig = await readPersistentFile();
 		const config = resolveConfig(ctx.sessionManager.getEntries(), process.env, _fileConfig);
