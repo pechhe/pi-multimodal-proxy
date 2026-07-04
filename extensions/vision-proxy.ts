@@ -87,6 +87,7 @@ import {
 	extractCandidateImagePaths,
 	extractCandidateVideoPaths,
 	extractCandidateAudioPaths,
+	applyDefaultModelFallback,
 	applyRecallCompletion,
 	buildRecallItems,
 	collectRecallCandidates,
@@ -436,6 +437,15 @@ async function pickVisionModel(
 
 function shouldStripImages(config: VisionConfig, model: ExtensionContext["model"]): boolean {
 	return shouldStripImagesPure(config, model?.input);
+}
+
+/**
+ * Swap the untouched built-in default vision model for a fallback when the
+ * running Pi's catalog doesn't know it (e.g. Claude Sonnet 5 on Pi < 0.80.3).
+ * User-configured models are never rewritten.
+ */
+function withModelFallback(config: VisionConfig, ctx: ExtensionContext): VisionConfig {
+	return applyDefaultModelFallback(config, (p, m) => Boolean(ctx.modelRegistry.find(p, m)));
 }
 
 function friendlyModelLabel(
@@ -1398,7 +1408,7 @@ export default function (pi: ExtensionAPI) {
 				parameters: AnalyzeImageParams,
 				execute: async (_toolCallId, params, _signal, _onUpdate, extCtx) => {
 					const entries = extCtx.sessionManager.getEntries();
-					const config = resolveConfig(entries, process.env, _fileConfig);
+					const config = withModelFallback(resolveConfig(entries, process.env, _fileConfig), extCtx);
 
 					// Runtime check - tool may have been disabled mid-session
 					if (config.tool !== "on" || config.mode === "off") {
@@ -1521,7 +1531,7 @@ export default function (pi: ExtensionAPI) {
 			if (images.length === 0 && mediaFiles.length === 0) return;
 
 			const entries = ctx.sessionManager.getEntries();
-			const config = resolveConfig(entries, process.env, _fileConfig);
+			const config = withModelFallback(resolveConfig(entries, process.env, _fileConfig), ctx);
 			const conversationContext = config.includeContext
 				? buildConversationContext(ctx.sessionManager.getBranch())
 				: "";
@@ -1981,7 +1991,7 @@ export default function (pi: ExtensionAPI) {
 				const parsed = parseModelString(value);
 				if (!parsed) {
 					ctx.ui.notify(
-						"Usage: /multimodal-proxy model provider/model-id\nExample: /multimodal-proxy model anthropic/claude-sonnet-4-5",
+						"Usage: /multimodal-proxy model provider/model-id\nExample: /multimodal-proxy model anthropic/claude-sonnet-5",
 						"warning",
 					);
 					return;
@@ -2275,7 +2285,7 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				// Resolve model override
-				let descConfig = effective;
+				let descConfig = withModelFallback(effective, ctx);
 				if (parsed.model) {
 					const parsedModel = parseModelString(parsed.model);
 					if (!parsedModel) {

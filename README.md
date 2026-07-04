@@ -12,6 +12,7 @@ When **video or audio files** are detected, they are routed to a **multimodal mo
 - **Overflow-aware sizing** (Pi ≥ 0.79.10) — using the new `reason`/`willRetry` metadata on Pi's compaction events, the digest switches to lean per-item budgets after an overflow-recovery compaction, so restoring descriptions never contributes to a second overflow. On older Pi versions the digest simply uses its normal budgets.
 - The digest caps at the 12 most recent images and 4 most recent video/audio files, restates the UNTRUSTED-content warning, and is injected directly after the compaction summary on every LLM call until the media becomes visible in context again.
 - **`#` image-recall autocomplete** — type `#` in the prompt editor to get a dropdown of images seen earlier in the session (newest first; keep typing to fuzzy-filter by filename or description). Picking one inserts the image's stable `image="..."` recall id, so you can write *"zoom into `#`⇥"* instead of copying ids out of fences. Requires Pi ≥ 0.79.1; silently unavailable in RPC/print modes.
+- **Default vision model is now Claude Sonnet 5** (`anthropic/claude-sonnet-5`, available since Pi 0.80.3). On older Pi versions whose catalog doesn't include Sonnet 5, the untouched default automatically falls back to `anthropic/claude-sonnet-4-5`; explicitly configured models are never rewritten.
 
 ## What's new in 1.7.0
 
@@ -82,7 +83,7 @@ Legacy alias: /vision-proxy <args> works identically.
 | Variable | Values | Default |
 |----------|--------|---------|
 | `PI_VISION_PROXY_MODE` | `fallback`, `always`, `off` | `fallback` |
-| `PI_VISION_PROXY_MODEL` | `provider/model-id` | `anthropic/claude-sonnet-4-5` |
+| `PI_VISION_PROXY_MODEL` | `provider/model-id` | `anthropic/claude-sonnet-5` |
 | `PI_VISION_PROXY_INCLUDE_CONTEXT` | bool | `true` |
 | `PI_VISION_PROXY_TOOL` | `on`, `off` | `on` |
 | `PI_VISION_PROXY_MAX_IMAGES_PER_CALL` | 1–20 | `10` |
@@ -223,7 +224,7 @@ When a model is in the grounding registry, a format-specific instruction is appe
 
 ## Privacy & security
 
-This extension **sends data to a third-party provider**. By default that is `anthropic/claude-sonnet-4-5` for images and `xai/grok-4.3` for video/audio. Be aware:
+This extension **sends data to a third-party provider**. By default that is `anthropic/claude-sonnet-5` for images (`anthropic/claude-sonnet-4-5` on older Pi versions without Sonnet 5 in the catalog) and `xai/grok-4.3` for video/audio. Be aware:
 
 1. **Image and video data is uploaded** to the configured provider on every proxied request. Crop coordinates are applied locally before upload — only the cropped region is sent.
 2. **Recent conversation context** (last 8 messages, truncated) is uploaded with the image unless you set `/multimodal-proxy context off` or `PI_VISION_PROXY_INCLUDE_CONTEXT=false`. Disable it for sensitive sessions.

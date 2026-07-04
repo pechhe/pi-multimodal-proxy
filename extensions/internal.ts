@@ -620,7 +620,7 @@ export const DEFAULT_VIDEO_SYSTEM_PROMPT = [
 export const DEFAULT_CONFIG: VisionConfig = {
 	mode: "fallback",
 	provider: "anthropic",
-	modelId: "claude-sonnet-4-5",
+	modelId: "claude-sonnet-5",
 	systemPrompt: [
 		"You are a precise image analysis assistant.",
 		"Describe the image factually for a downstream agent that may act on the description.",
@@ -863,6 +863,35 @@ export function resolveConfig(
 	fileConfig: Partial<VisionConfig> = {},
 ): VisionConfig {
 	return sanitize({ ...DEFAULT_CONFIG, ...fileConfig, ...readPersistedConfig(entries), ...readEnvOverrides(env) });
+}
+
+/**
+ * Ordered fallbacks tried when the built-in default vision model is missing
+ * from the model registry — e.g. Pi < 0.80.3 catalogs without Claude Sonnet 5.
+ */
+export const DEFAULT_MODEL_FALLBACKS: ReadonlyArray<{ provider: string; modelId: string }> = [
+	{ provider: "anthropic", modelId: "claude-sonnet-4-5" },
+];
+
+/**
+ * Substitute the built-in default vision model with the first available
+ * fallback when the registry doesn't know it. Applies only while the model is
+ * the untouched built-in default — a model the user explicitly configured is
+ * never rewritten (its absence still surfaces as "Model not found").
+ */
+export function applyDefaultModelFallback(
+	config: VisionConfig,
+	hasModel: (provider: string, modelId: string) => boolean,
+): VisionConfig {
+	const isBuiltinDefault =
+		config.provider === DEFAULT_CONFIG.provider && config.modelId === DEFAULT_CONFIG.modelId;
+	if (!isBuiltinDefault || hasModel(config.provider, config.modelId)) return config;
+	for (const fb of DEFAULT_MODEL_FALLBACKS) {
+		if (hasModel(fb.provider, fb.modelId)) {
+			return { ...config, provider: fb.provider, modelId: fb.modelId };
+		}
+	}
+	return config;
 }
 
 // ── Session-entry helpers ──────────────────────────────────────────────────
