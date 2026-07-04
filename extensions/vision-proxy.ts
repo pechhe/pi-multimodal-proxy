@@ -87,9 +87,15 @@ import {
 	extractCandidateImagePaths,
 	extractCandidateVideoPaths,
 	extractCandidateAudioPaths,
+	applyRecallCompletion,
+	buildRecallItems,
+	collectRecallCandidates,
+	extractRecallToken,
 	fenceUntrusted,
 	findDescriptions,
 	findVideoDescriptions,
+	parseRecallItemValue,
+	type RecallAutocompleteItem,
 	fixVideoAudioPayload,
 	fuzzyMatches,
 	generateFilenameHints,
@@ -1306,8 +1312,74 @@ async function handleAnalyzeImage(
 
 // ── Extension ──────────────────────────────────────────────────────────────
 
+/**
+ * Structural subset of pi-tui's AutocompleteProvider. pi-tui is not a declared
+ * peer dependency, so the shape is restated here; the extension host passes the
+ * real provider, which satisfies it structurally.
+ */
+interface EditorAutocompleteProvider {
+	triggerCharacters?: string[];
+	getSuggestions(
+		lines: string[],
+		cursorLine: number,
+		cursorCol: number,
+		options: { signal: AbortSignal; force?: boolean },
+	): Promise<{ items: RecallAutocompleteItem[]; prefix: string } | null>;
+	applyCompletion(
+		lines: string[],
+		cursorLine: number,
+		cursorCol: number,
+		item: RecallAutocompleteItem,
+		prefix: string,
+	): { lines: string[]; cursorLine: number; cursorCol: number };
+	shouldTriggerFileCompletion?(lines: string[], cursorLine: number, cursorCol: number): boolean;
+}
+
 export default function (pi: ExtensionAPI) {
 	let _toolRegistered = false;
+	let _autocompleteRegistered = false;
+
+	/**
+	 * Stack a `#` recall provider on the editor autocomplete: typing `#` at a
+	 * token boundary suggests images seen earlier in the session and inserts
+	 * the picked image's stable `image="<hash>"` recall id. Falls through to
+	 * the wrapped provider when the token matches no image, and is a no-op in
+	 * RPC/print modes (the host stubs addAutocompleteProvider there).
+	 */
+	function registerRecallAutocomplete(ctx: ExtensionContext) {
+		if (_autocompleteRegistered) return;
+		if (typeof ctx.ui.addAutocompleteProvider !== "function") return; // older pi without the API
+		_autocompleteRegistered = true;
+		ctx.ui.addAutocompleteProvider(
+			(current: EditorAutocompleteProvider): EditorAutocompleteProvider => ({
+				triggerCharacters: [...new Set([...(current.triggerCharacters ?? []), "#"])],
+				shouldTriggerFileCompletion: current.shouldTriggerFileCompletion?.bind(current),
+				async getSuggestions(lines, cursorLine, cursorCol, options) {
+					const token = extractRecallToken(lines, cursorLine, cursorCol);
+					if (token) {
+						const entries = ctx.sessionManager.getEntries();
+						const config = resolveConfig(entries, process.env, _fileConfig);
+						if (config.mode !== "off") {
+							const candidates = collectRecallCandidates(
+								findDescriptions(entries),
+								(hash) => getSessionState(ctx).imageMeta.get(hash),
+							);
+							const items = buildRecallItems(candidates, token.query);
+							if (items.length > 0) return { items, prefix: token.prefix };
+						}
+					}
+					return current.getSuggestions(lines, cursorLine, cursorCol, options);
+				},
+				applyCompletion(lines, cursorLine, cursorCol, item, prefix) {
+					const hash = parseRecallItemValue(item.value);
+					if (hash !== null) {
+						return applyRecallCompletion(lines, cursorLine, cursorCol, hash, prefix);
+					}
+					return current.applyCompletion(lines, cursorLine, cursorCol, item, prefix);
+				},
+			}),
+		);
+	}
 
 	/** Register or unregister the analyze_image tool based on config. */
 	function syncToolRegistration(config: VisionConfig) {
@@ -1372,6 +1444,9 @@ export default function (pi: ExtensionAPI) {
 
 		// Register tool if enabled
 		syncToolRegistration(config);
+
+		// Stack the `#` image-recall autocomplete on the editor
+		registerRecallAutocomplete(ctx);
 	});
 
 	pi.on(

@@ -211,6 +211,114 @@ export function formatProgressStatus(label: string, frame: string, elapsedSec: n
 export const RECALL_HINT =
 	'You can re-examine or crop this or any earlier image at any time by calling analyze_image with its image id (the image="…" value above) — no re-attachment or file path needed.';
 
+// ── Recall autocomplete (`#` trigger) ───────────────────────────────────────
+// Typing `#` at a token boundary in the editor suggests images seen earlier in
+// the session; picking one inserts its stable `image="<hash>"` recall id, so
+// users never have to copy ids out of fences.
+
+/** Marker prefix distinguishing recall items from other providers' items. */
+export const RECALL_AC_VALUE_PREFIX = "vision-proxy-recall:";
+
+/** Maximum suggestions shown for a `#` recall query. */
+export const RECALL_AC_MAX_ITEMS = 8;
+
+export interface RecallCandidate {
+	hash: string;
+	filename?: string;
+	description?: string;
+}
+
+/** Structural subset of pi-tui's AutocompleteItem (not a declared peer dep). */
+export interface RecallAutocompleteItem {
+	value: string;
+	label: string;
+	description?: string;
+}
+
+/**
+ * Extract the `#`-prefixed token immediately before the cursor, or null when
+ * the cursor is not inside one. `query` is the text after `#`; `prefix` is the
+ * full token including `#`, as the editor expects it back in the suggestions.
+ */
+export function extractRecallToken(
+	lines: readonly string[],
+	cursorLine: number,
+	cursorCol: number,
+): { query: string; prefix: string } | null {
+	const before = (lines[cursorLine] ?? "").slice(0, cursorCol);
+	const m = before.match(/(?:^|\s)(#([^\s]*))$/);
+	return m ? { query: m[2]!, prefix: m[1]! } : null;
+}
+
+/**
+ * Collect recall candidates from persisted descriptions, most recent first.
+ * `metaLookup` supplies in-memory filename/dimensions when still available.
+ */
+export function collectRecallCandidates(
+	descriptions: ReadonlyMap<string, string>,
+	metaLookup: (hash: string) => ImageMeta | undefined,
+): RecallCandidate[] {
+	return [...descriptions]
+		.reverse()
+		.map(([hash, description]) => ({ hash, description, filename: metaLookup(hash)?.filename }));
+}
+
+/** One-line dropdown snippet (no fence markers, single line, hard cap). */
+function digestLabelSnippet(text: string, max = 60): string {
+	const oneLine = text.replace(/\s+/g, " ").trim();
+	return oneLine.length <= max ? oneLine : `${oneLine.slice(0, max - 1).trimEnd()}…`;
+}
+
+/**
+ * Build autocomplete items for a `#` recall query. Empty query lists all
+ * candidates (newest first); otherwise fuzzy-matches filename, hash, and
+ * description.
+ */
+export function buildRecallItems(
+	candidates: readonly RecallCandidate[],
+	query: string,
+	limit = RECALL_AC_MAX_ITEMS,
+): RecallAutocompleteItem[] {
+	const q = query.trim();
+	const matched = q
+		? candidates.filter((c) =>
+			fuzzyMatches(`${c.filename ?? ""} ${c.hash} ${c.description ?? ""}`, q),
+		)
+		: candidates;
+	return matched.slice(0, limit).map((c) => ({
+		value: `${RECALL_AC_VALUE_PREFIX}${c.hash}`,
+		label: c.filename ?? `${c.hash.slice(0, 12)}…`,
+		description: c.description ? digestLabelSnippet(c.description) : undefined,
+	}));
+}
+
+/** Extract the hash from a recall autocomplete item value, or null. */
+export function parseRecallItemValue(value: string): string | null {
+	return value.startsWith(RECALL_AC_VALUE_PREFIX)
+		? value.slice(RECALL_AC_VALUE_PREFIX.length)
+		: null;
+}
+
+/**
+ * Replace the `#token` before the cursor with the fence-style recall id
+ * (`image="<hash>" `), returning the editor's expected new state.
+ */
+export function applyRecallCompletion(
+	lines: readonly string[],
+	cursorLine: number,
+	cursorCol: number,
+	hash: string,
+	prefix: string,
+): { lines: string[]; cursorLine: number; cursorCol: number } {
+	const line = lines[cursorLine] ?? "";
+	const start = Math.max(0, cursorCol - prefix.length);
+	const insert = `image="${hash}" `;
+	const newLine = line.slice(0, start) + insert + line.slice(cursorCol);
+	const newLines = [...lines];
+	newLines[cursorLine] = newLine;
+	return { lines: newLines, cursorLine, cursorCol: start + insert.length };
+}
+
 // ── Crop types ────────────────────────────────────────────────────────────
 
 export type NamedRegion =
