@@ -48,12 +48,14 @@ import type {
 	ContextEvent,
 	ExtensionAPI,
 	ExtensionContext,
+	SessionCompactEvent,
 	SessionEntry,
 	SessionStartEvent,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
 	buildAnalysisFence,
+	buildCompactionDigest,
 	buildConversationContext,
 	buildDescriptionFence,
 	buildGroundingInstruction,
@@ -87,6 +89,7 @@ import {
 	extractCandidateAudioPaths,
 	fenceUntrusted,
 	findDescriptions,
+	findVideoDescriptions,
 	fixVideoAudioPayload,
 	fuzzyMatches,
 	generateFilenameHints,
@@ -228,6 +231,12 @@ interface SessionState {
 	imageMeta: ImageMetaStore;
 	/** Retained image bytes for analyze_image session recall. */
 	imageData: ImageDataStore;
+	/**
+	 * Trigger metadata of the most recent compaction (pi ≥ 0.79.10 populates
+	 * reason/willRetry; older runtimes leave them undefined). Used to size the
+	 * post-compaction recall digest.
+	 */
+	compaction?: { reason?: "manual" | "threshold" | "overflow"; willRetry?: boolean };
 }
 
 const _sessionState = new WeakMap<object, SessionState>();
@@ -1355,6 +1364,7 @@ export default function (pi: ExtensionAPI) {
 		state.toolCallCount = 0;
 		state.imageMeta.clear();
 		clearImageData(state.imageData);
+		state.compaction = undefined;
 
 		_fileConfig = await readPersistentFile();
 		const config = resolveConfig(ctx.sessionManager.getEntries(), process.env, _fileConfig);
@@ -1696,14 +1706,28 @@ export default function (pi: ExtensionAPI) {
 		},
 	);
 
+	// Record what triggered the most recent compaction. Pi ≥ 0.79.10 populates
+	// reason/willRetry (manual /compact vs. threshold auto-compaction vs.
+	// overflow recovery); on older runtimes both stay undefined and the digest
+	// below simply uses its normal budgets.
+	pi.on("session_compact", async (event: SessionCompactEvent, ctx: ExtensionContext) => {
+		const meta = event as SessionCompactEvent & {
+			reason?: "manual" | "threshold" | "overflow";
+			willRetry?: boolean;
+		};
+		getSessionState(ctx).compaction = { reason: meta.reason, willRetry: meta.willRetry };
+	});
+
 	pi.on("context", async (event: ContextEvent, ctx: ExtensionContext) => {
 		const entries = ctx.sessionManager.getEntries();
 		const config = resolveConfig(entries, process.env, _fileConfig);
 
-		if (!shouldStripImages(config, ctx.model)) return;
+		const strip = shouldStripImages(config, ctx.model);
+		if (!strip && config.mode === "off") return;
 
 		const descriptions = findDescriptions(entries);
-		const imageMeta = getSessionState(ctx).imageMeta;
+		const sessionState = getSessionState(ctx);
+		const imageMeta = sessionState.imageMeta;
 
 		// Restate the recall affordance once per context build (not per image),
 		// so the agent is reminded it can re-query earlier images even on turns
@@ -1712,7 +1736,7 @@ export default function (pi: ExtensionAPI) {
 		let recallHintInjected = false;
 
 		let modified = false;
-		const messages = event.messages.map((msg) => {
+		let messages = !strip ? event.messages : event.messages.map((msg) => {
 			if (msg.role !== "user" || !Array.isArray(msg.content)) return msg;
 
 			const hasImageBlock = msg.content.some((c) => c.type === "image");
@@ -1754,6 +1778,64 @@ export default function (pi: ExtensionAPI) {
 			}
 			return { ...msg, content: newContent };
 		});
+
+		// ── Post-compaction recall digest ─────────────────────────────────
+		// Compaction summarizes away the user messages that carried image
+		// blocks (and the video fences injected into system prompts), so the
+		// mapping above finds nothing to annotate and the agent loses all
+		// media knowledge. The description entries persisted in the session
+		// survive compaction — restore the ones no longer visible in context
+		// as a truncated digest keyed by the same ids analyze_image accepts.
+		if (ctx.sessionManager.getBranch().some((e) => e.type === "compaction")) {
+			const videoDescriptions = findVideoDescriptions(entries);
+			if (descriptions.size > 0 || videoDescriptions.size > 0) {
+				const visibleHashes = new Set<string>();
+				const textChunks: string[] = [];
+				for (const msg of messages) {
+					if (!("content" in msg)) continue;
+					if (typeof msg.content === "string") {
+						textChunks.push(msg.content);
+						continue;
+					}
+					if (!Array.isArray(msg.content)) continue;
+					for (const c of msg.content) {
+						if (c.type === "image") visibleHashes.add(hashImageData(c.data));
+						else if (c.type === "text") textChunks.push(c.text);
+					}
+				}
+				const visibleText = textChunks.join("\n");
+				const isVisible = (hash: string) => visibleHashes.has(hash) || visibleText.includes(hash);
+
+				const unseenImages = [...descriptions]
+					.filter(([hash]) => !isVisible(hash))
+					.map(([hash, description]) => ({ hash, description, meta: imageMeta.get(hash) }));
+				const unseenVideos = [...videoDescriptions.values()].filter((v) => !isVisible(v.hash));
+
+				const lean =
+					sessionState.compaction?.reason === "overflow" ||
+					sessionState.compaction?.willRetry === true;
+				const digest = buildCompactionDigest(unseenImages, unseenVideos, {
+					lean,
+					toolEnabled: config.tool === "on",
+				});
+				if (digest) {
+					// Place the digest right after the first user message — post-
+					// compaction that is the summary, so the digest reads as
+					// restored background rather than a fresh request.
+					const digestMsg = {
+						role: "user" as const,
+						content: [{ type: "text" as const, text: digest }],
+						timestamp: Date.now(),
+					};
+					const idx = messages.findIndex((m) => m.role === "user");
+					messages =
+						idx === -1
+							? [digestMsg, ...messages]
+							: [...messages.slice(0, idx + 1), digestMsg, ...messages.slice(idx + 1)];
+					modified = true;
+				}
+			}
+		}
 
 		if (modified) return { messages };
 	});

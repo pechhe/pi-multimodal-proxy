@@ -6,6 +6,12 @@ When images are sent, this extension routes them to a **vision-capable model**, 
 
 When **video or audio files** are detected, they are routed to a **multimodal model** (default: Grok 4.3) that natively understands video content — transcribing speech with speaker diarization, describing visual scenes, reading on-screen text, and reasoning about the content — all in a single call.
 
+## What's new in 1.8.0
+
+- **Media knowledge survives context compaction** — when Pi compacts the conversation, the user messages that carried image attachments (and injected video fences) are summarized away, which previously left the agent blind to all earlier media. The proxy now detects compaction on the active branch and re-injects a **post-compaction recall digest**: truncated image/video descriptions keyed by the same stable `image="..."` ids that `analyze_image` accepts, so the agent can still reason about — and re-query — *"that screenshot from before"* after a `/compact` or auto-compaction.
+- **Overflow-aware sizing** (Pi ≥ 0.79.10) — using the new `reason`/`willRetry` metadata on Pi's compaction events, the digest switches to lean per-item budgets after an overflow-recovery compaction, so restoring descriptions never contributes to a second overflow. On older Pi versions the digest simply uses its normal budgets.
+- The digest caps at the 12 most recent images and 4 most recent video/audio files, restates the UNTRUSTED-content warning, and is injected directly after the compaction summary on every LLM call until the media becomes visible in context again.
+
 ## What's new in 1.7.0
 
 - **Session image recall** — the agent can re-query an image it saw earlier in the session without a re-attachment or file path. Pass the `image="..."` id from any vision-proxy fence back to `analyze_image` (or `/multimodal-proxy describe`) to re-examine or crop *"that screenshot from before"*. Image bytes are retained in memory only (never persisted), in a byte-bounded LRU store configurable via `PI_VISION_PROXY_IMAGE_RECALL_BYTES` (default 64 MB). A once-per-turn reminder keeps the recall affordance visible to the agent even on turns where no new image was attached.

@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.8.0] - 2026-07-04
+
+### Added
+
+- **Compaction survival** — media knowledge now survives context compaction. Previously, compaction summarized away the user messages carrying image blocks (and the injected video fences), so the `context` handler had nothing left to annotate and the agent lost all knowledge of earlier images/videos — even though the description entries were still persisted in the session. Now, when the active branch contains a compaction entry, the proxy detects which persisted image/video descriptions are no longer visible in context and re-injects them as a **post-compaction recall digest**: truncated description fences keyed by the same stable `image="..."` ids that `analyze_image` recall accepts, placed directly after the compaction summary.
+- **Compaction-trigger awareness** (Pi ≥ 0.79.10) — a `session_compact` handler records the compaction's `reason`/`willRetry` metadata. After an **overflow-recovery** compaction (context hit the hard limit and the turn is retried), the digest switches to lean budgets (200/240 chars per image/video instead of 600/800) so re-injection doesn't contribute to a second overflow. On older Pi runtimes the fields are absent and the digest simply uses its normal budgets.
+- New helpers in `internal.ts`, all covered by unit tests: `findVideoDescriptions` (latest persisted entry per hash), `truncateForDigest` (word-boundary truncation with `… [truncated]` marker), and `buildCompactionDigest` (caps at the 12 most recent images / 4 most recent videos, restates the UNTRUSTED warning, and mentions `analyze_image` recall only when the tool is enabled).
+
+### Changed
+
+- The `context` handler no longer returns early when the active model supports images natively — the post-compaction digest is injected whenever the proxy is not `off` and orphaned descriptions exist, since natively-visioned models also lose compacted-away images. Image-block stripping behavior is unchanged.
+
 ## [1.7.0] - 2026-06-20
 
 ### Added
