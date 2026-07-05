@@ -78,6 +78,17 @@ describe("buildRecallItems", () => {
 		assert.equal(buildRecallItems(candidates, "zzz-no-match").length, 0);
 	});
 
+	it("matches the hash by prefix only, not by fuzzy subsequence", () => {
+		// "b" is a prefix of the second hash but no subsequence match on the
+		// first candidate's filename/description — hex letters must not match
+		// every image via the 32-hex hash.
+		const byPrefix = buildRecallItems(candidates, "bbbb");
+		assert.equal(byPrefix.length, 1);
+		assert.ok(byPrefix[0]!.value.endsWith("b".repeat(32)));
+		const q = buildRecallItems(candidates, "eeee");
+		assert.equal(q.length, 0, "hex query matching no prefix and no text must return nothing");
+	});
+
 	it("truncates dropdown descriptions to a single short line", () => {
 		const long = [{ hash: "c".repeat(32), description: `x${"y z".repeat(80)}` }];
 		const item = buildRecallItems(long, "")[0]!;

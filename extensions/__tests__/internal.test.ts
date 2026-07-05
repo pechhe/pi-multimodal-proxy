@@ -2410,6 +2410,38 @@ describe("applyDefaultModelFallback", () => {
 		assert.equal(out.modelId, DEFAULT_CONFIG.modelId);
 	});
 
+	it("never rewrites a model persisted with modelExplicit, even the default pair", () => {
+		const explicit = { ...DEFAULT_CONFIG, modelExplicit: true };
+		const out = applyDefaultModelFallback(explicit, () => false);
+		assert.equal(out.modelId, DEFAULT_CONFIG.modelId);
+	});
+
+	it("upgrades an implicit legacy baked-in default to the current default when available", () => {
+		const legacy = { ...DEFAULT_CONFIG, provider: "anthropic", modelId: "claude-sonnet-4-5" };
+		const out = applyDefaultModelFallback(
+			legacy,
+			registryWith(`${DEFAULT_CONFIG.provider}/${DEFAULT_CONFIG.modelId}`, "anthropic/claude-sonnet-4-5"),
+		);
+		assert.equal(out.modelId, DEFAULT_CONFIG.modelId);
+	});
+
+	it("keeps a legacy default as-is when the current default is not in the registry", () => {
+		const legacy = { ...DEFAULT_CONFIG, provider: "anthropic", modelId: "claude-sonnet-4-5" };
+		const out = applyDefaultModelFallback(legacy, registryWith("anthropic/claude-sonnet-4-5"));
+		assert.equal(out.modelId, "claude-sonnet-4-5");
+	});
+
+	it("does not upgrade a legacy-default model marked modelExplicit", () => {
+		const legacy = {
+			...DEFAULT_CONFIG,
+			provider: "anthropic",
+			modelId: "claude-sonnet-4-5",
+			modelExplicit: true,
+		};
+		const out = applyDefaultModelFallback(legacy, () => true);
+		assert.equal(out.modelId, "claude-sonnet-4-5");
+	});
+
 	it("does not mutate the other config fields when substituting", () => {
 		const fb = DEFAULT_MODEL_FALLBACKS[0]!;
 		const cfg = { ...DEFAULT_CONFIG, mode: "always" as const, cacheSize: 7 };

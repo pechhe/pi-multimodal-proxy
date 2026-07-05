@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
 	buildCompactionDigest,
+	collectVisibleFenceIds,
 	CUSTOM_TYPE_DESCRIPTION,
 	CUSTOM_TYPE_VIDEO_DESCRIPTION,
 	DIGEST_IMAGE_CHARS,
@@ -107,6 +108,43 @@ describe("truncateForDigest", () => {
 	it("hard-cuts when there is no usable word boundary", () => {
 		const out = truncateForDigest("a".repeat(50), 20);
 		assert.equal(out, `${"a".repeat(20)} … [truncated]`);
+	});
+
+	it("never splits a surrogate pair on a hard cut", () => {
+		// "💥" is 2 UTF-16 code units; a cut at max=21 would land mid-pair.
+		const out = truncateForDigest(`${"x".repeat(20)}💥${"y".repeat(30)}`, 21);
+		assert.ok(!/[\uD800-\uDBFF]$/.test(out.replace(" … [truncated]", "")));
+		assert.ok(!out.includes("�"));
+		assert.equal(out, `${"x".repeat(20)} … [truncated]`);
+	});
+});
+
+describe("collectVisibleFenceIds", () => {
+	const h1 = "a".repeat(32);
+	const h2 = "b".repeat(32);
+	const h3 = "c".repeat(32);
+
+	it("collects ids from description, analysis, joint, and video fences", () => {
+		const text = [
+			`<vision_proxy_description image="${h1}" width="10"\n>body\n</vision_proxy_description>`,
+			`<vision_proxy_analysis image="${h2}#crop:1,2,3,4"\n>body\n</vision_proxy_analysis>`,
+			`dimensions='[{"image":"${h3}","width":5}]'`,
+			`<vision_proxy_video_description file="v.mp4" hash="${h1}" mime="video/mp4"\n>t\n</vision_proxy_video_description>`,
+		].join("\n");
+		const ids = collectVisibleFenceIds(text);
+		assert.deepEqual([...ids].sort(), [h1, h2, h3]);
+	});
+
+	it("ignores bare hashes and user-typed recall references", () => {
+		const ids = collectVisibleFenceIds(`zoom into image="${h1}" and also ${h2} please`);
+		assert.equal(ids.size, 0);
+	});
+
+	it("accumulates into a provided set", () => {
+		const out = new Set<string>();
+		collectVisibleFenceIds(`<vision_proxy_description image="${h1}"\n>x\n</vision_proxy_description>`, out);
+		collectVisibleFenceIds(`<vision_proxy_description image="${h2}"\n>x\n</vision_proxy_description>`, out);
+		assert.equal(out.size, 2);
 	});
 });
 
