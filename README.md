@@ -6,6 +6,14 @@ When images are sent, this extension routes them to a **vision-capable model**, 
 
 When **video or audio files** are detected, they are routed to a **multimodal model** (default: Grok 4.3) that natively understands video content — transcribing speech with speaker diarization, describing visual scenes, reading on-screen text, and reasoning about the content — all in a single call.
 
+## What's new in 1.8.0
+
+- **Media knowledge survives context compaction** — when Pi compacts the conversation, the user messages that carried image attachments (and injected video fences) are summarized away, which previously left the agent blind to all earlier media. The proxy now detects compaction on the active branch and re-injects a **post-compaction recall digest**: truncated image/video descriptions keyed by the same stable `image="..."` ids that `analyze_image` accepts, so the agent can still reason about — and re-query — *"that screenshot from before"* after a `/compact` or auto-compaction.
+- **Overflow-aware sizing** (Pi ≥ 0.79.10) — using the new `reason`/`willRetry` metadata on Pi's compaction events, the digest switches to lean per-item budgets after an overflow-recovery compaction, so restoring descriptions never contributes to a second overflow. On older Pi versions the digest simply uses its normal budgets.
+- The digest caps at the 12 most recent images and 4 most recent video/audio files, restates the UNTRUSTED-content warning, and is injected directly after the compaction summary on every LLM call until the media becomes visible in context again.
+- **`#` image-recall autocomplete** — type `#` in the prompt editor to get a dropdown of images seen earlier in the session (newest first; keep typing to fuzzy-filter by filename or description). Picking one inserts the image's stable `image="..."` recall id, so you can write *"zoom into `#`⇥"* instead of copying ids out of fences. Requires Pi ≥ 0.79.1; silently unavailable in RPC/print modes.
+- **Default vision model is now Claude Sonnet 5** (`anthropic/claude-sonnet-5`, available since Pi 0.80.3). Models you never chose explicitly track the package default: configs that merely inherited the old default (`claude-sonnet-4-5`) are upgraded when Sonnet 5 is in the catalog, and on older Pi versions the default falls back to `claude-sonnet-4-5`. Models chosen explicitly — via `/multimodal-proxy model`, `pick`, or `PI_VISION_PROXY_MODEL` — are never rewritten.
+
 ## What's new in 1.7.0
 
 - **Session image recall** — the agent can re-query an image it saw earlier in the session without a re-attachment or file path. Pass the `image="..."` id from any vision-proxy fence back to `analyze_image` (or `/multimodal-proxy describe`) to re-examine or crop *"that screenshot from before"*. Image bytes are retained in memory only (never persisted), in a byte-bounded LRU store configurable via `PI_VISION_PROXY_IMAGE_RECALL_BYTES` (default 64 MB). A once-per-turn reminder keeps the recall affordance visible to the agent even on turns where no new image was attached.
@@ -75,7 +83,7 @@ Legacy alias: /vision-proxy <args> works identically.
 | Variable | Values | Default |
 |----------|--------|---------|
 | `PI_VISION_PROXY_MODE` | `fallback`, `always`, `off` | `fallback` |
-| `PI_VISION_PROXY_MODEL` | `provider/model-id` | `anthropic/claude-sonnet-4-5` |
+| `PI_VISION_PROXY_MODEL` | `provider/model-id` | `anthropic/claude-sonnet-5` |
 | `PI_VISION_PROXY_INCLUDE_CONTEXT` | bool | `true` |
 | `PI_VISION_PROXY_TOOL` | `on`, `off` | `on` |
 | `PI_VISION_PROXY_MAX_IMAGES_PER_CALL` | 1–20 | `10` |
@@ -216,7 +224,7 @@ When a model is in the grounding registry, a format-specific instruction is appe
 
 ## Privacy & security
 
-This extension **sends data to a third-party provider**. By default that is `anthropic/claude-sonnet-4-5` for images and `xai/grok-4.3` for video/audio. Be aware:
+This extension **sends data to a third-party provider**. By default that is `anthropic/claude-sonnet-5` for images (`anthropic/claude-sonnet-4-5` on older Pi versions without Sonnet 5 in the catalog) and `xai/grok-4.3` for video/audio. Be aware:
 
 1. **Image and video data is uploaded** to the configured provider on every proxied request. Crop coordinates are applied locally before upload — only the cropped region is sent.
 2. **Recent conversation context** (last 8 messages, truncated) is uploaded with the image unless you set `/multimodal-proxy context off` or `PI_VISION_PROXY_INCLUDE_CONTEXT=false`. Disable it for sensitive sessions.

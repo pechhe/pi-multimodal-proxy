@@ -2371,3 +2371,82 @@ describe("Review fixes: storeImageMeta filename backfill", () => {
 		assert.equal(sessionB.get("shared-hash"), undefined, "session B must not inherit it");
 	});
 });
+
+// ── Default model fallback (1.8.0) ──────────────────────────────────────────
+
+import { applyDefaultModelFallback, DEFAULT_MODEL_FALLBACKS } from "../internal.ts";
+
+describe("applyDefaultModelFallback", () => {
+	const registryWith = (...models: string[]) => (p: string, m: string) => models.includes(`${p}/${m}`);
+	const builtin = { ...DEFAULT_CONFIG };
+
+	it("keeps the built-in default when the registry knows it", () => {
+		const out = applyDefaultModelFallback(builtin, registryWith(`${builtin.provider}/${builtin.modelId}`));
+		assert.equal(out.modelId, DEFAULT_CONFIG.modelId);
+	});
+
+	it("falls back to the first available fallback on older catalogs", () => {
+		const fb = DEFAULT_MODEL_FALLBACKS[0]!;
+		const out = applyDefaultModelFallback(builtin, registryWith(`${fb.provider}/${fb.modelId}`));
+		assert.equal(out.provider, fb.provider);
+		assert.equal(out.modelId, fb.modelId);
+	});
+
+	it("returns the config unchanged when no fallback is available either", () => {
+		const out = applyDefaultModelFallback(builtin, () => false);
+		assert.equal(out.modelId, DEFAULT_CONFIG.modelId);
+	});
+
+	it("never rewrites a user-configured model, even when it is missing", () => {
+		const custom = { ...DEFAULT_CONFIG, provider: "openai", modelId: "gpt-5.5" };
+		const out = applyDefaultModelFallback(custom, () => false);
+		assert.equal(out.provider, "openai");
+		assert.equal(out.modelId, "gpt-5.5");
+	});
+
+	it("never rewrites an explicit user choice that equals the built-in default (userConfigured)", () => {
+		const out = applyDefaultModelFallback(builtin, () => false, true);
+		assert.equal(out.provider, DEFAULT_CONFIG.provider);
+		assert.equal(out.modelId, DEFAULT_CONFIG.modelId);
+	});
+
+	it("never rewrites a model persisted with modelExplicit, even the default pair", () => {
+		const explicit = { ...DEFAULT_CONFIG, modelExplicit: true };
+		const out = applyDefaultModelFallback(explicit, () => false);
+		assert.equal(out.modelId, DEFAULT_CONFIG.modelId);
+	});
+
+	it("upgrades an implicit legacy baked-in default to the current default when available", () => {
+		const legacy = { ...DEFAULT_CONFIG, provider: "anthropic", modelId: "claude-sonnet-4-5" };
+		const out = applyDefaultModelFallback(
+			legacy,
+			registryWith(`${DEFAULT_CONFIG.provider}/${DEFAULT_CONFIG.modelId}`, "anthropic/claude-sonnet-4-5"),
+		);
+		assert.equal(out.modelId, DEFAULT_CONFIG.modelId);
+	});
+
+	it("keeps a legacy default as-is when the current default is not in the registry", () => {
+		const legacy = { ...DEFAULT_CONFIG, provider: "anthropic", modelId: "claude-sonnet-4-5" };
+		const out = applyDefaultModelFallback(legacy, registryWith("anthropic/claude-sonnet-4-5"));
+		assert.equal(out.modelId, "claude-sonnet-4-5");
+	});
+
+	it("does not upgrade a legacy-default model marked modelExplicit", () => {
+		const legacy = {
+			...DEFAULT_CONFIG,
+			provider: "anthropic",
+			modelId: "claude-sonnet-4-5",
+			modelExplicit: true,
+		};
+		const out = applyDefaultModelFallback(legacy, () => true);
+		assert.equal(out.modelId, "claude-sonnet-4-5");
+	});
+
+	it("does not mutate the other config fields when substituting", () => {
+		const fb = DEFAULT_MODEL_FALLBACKS[0]!;
+		const cfg = { ...DEFAULT_CONFIG, mode: "always" as const, cacheSize: 7 };
+		const out = applyDefaultModelFallback(cfg, registryWith(`${fb.provider}/${fb.modelId}`));
+		assert.equal(out.mode, "always");
+		assert.equal(out.cacheSize, 7);
+	});
+});
