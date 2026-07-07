@@ -11,7 +11,7 @@ import { strict as assert } from "node:assert";
 import { after, describe, it } from "node:test";
 import { lstat, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
-import { join, parse } from "node:path";
+import { delimiter, join, parse } from "node:path";
 import {
 	buildConversationContext,
 	buildDescriptionFence,
@@ -45,6 +45,10 @@ import {
 	VIDEO_PATH_PLACEHOLDER,
 	isPathAllowed,
 	isValidNamedRegion,
+	expandLeadingTilde,
+	sanitizeAllowedFolders,
+	pathAccessFromConfig,
+	MAX_ALLOWED_FOLDERS,
 	LRUCache,
 	normalizedToPixels,
 	parseModelString,
@@ -219,18 +223,41 @@ describe("readEnvOverrides", () => {
 		}
 		assert.equal(readEnvOverrides({ PI_VISION_PROXY_INCLUDE_CONTEXT: "garbage" }).includeContext, undefined);
 	});
+
+	it("parses allowHome truthy/falsy values", () => {
+		for (const v of ["1", "true", "yes", "on", "TRUE"]) {
+			assert.equal(readEnvOverrides({ PI_VISION_PROXY_ALLOW_HOME: v }).allowHome, true, `truthy ${v}`);
+		}
+		for (const v of ["0", "false", "no", "off"]) {
+			assert.equal(readEnvOverrides({ PI_VISION_PROXY_ALLOW_HOME: v }).allowHome, false, `falsy ${v}`);
+		}
+		assert.equal(readEnvOverrides({}).allowHome, undefined);
+		assert.equal(readEnvOverrides({ PI_VISION_PROXY_ALLOW_HOME: "garbage" }).allowHome, undefined);
+	});
+
+	it("parses allowedFolders as a delimiter-separated list of absolute paths", () => {
+		const out = readEnvOverrides({ PI_VISION_PROXY_ALLOWED_FOLDERS: ["/a/b", "relative", "/c"].join(delimiter) });
+		assert.deepEqual(out.allowedFolders, ["/a/b", "/c"]);
+		assert.equal(readEnvOverrides({}).allowedFolders, undefined);
+		// Set-but-useless value still overrides (locks) the persisted list with an empty one
+		assert.deepEqual(readEnvOverrides({ PI_VISION_PROXY_ALLOWED_FOLDERS: "relative" }).allowedFolders, []);
+	});
 });
 
 describe("envFlags", () => {
 	it("reports presence per variable", () => {
-		assert.deepEqual(envFlags({}), { mode: false, model: false, context: false, tool: false, maxImagesPerCall: false, maxBatch: false, cacheSize: false, videoModel: false });
+		assert.deepEqual(envFlags({}), { mode: false, model: false, context: false, tool: false, maxImagesPerCall: false, maxBatch: false, cacheSize: false, videoModel: false, allowHome: false, allowedFolders: false });
 		assert.deepEqual(
 			envFlags({
 				PI_VISION_PROXY_MODE: "x",
 				PI_VISION_PROXY_MODEL: "y",
 				PI_VISION_PROXY_INCLUDE_CONTEXT: "",
 			}),
-			{ mode: true, model: true, context: true, tool: false, maxImagesPerCall: false, maxBatch: false, cacheSize: false, videoModel: false },
+			{ mode: true, model: true, context: true, tool: false, maxImagesPerCall: false, maxBatch: false, cacheSize: false, videoModel: false, allowHome: false, allowedFolders: false },
+		);
+		assert.deepEqual(
+			envFlags({ PI_VISION_PROXY_ALLOW_HOME: "1", PI_VISION_PROXY_ALLOWED_FOLDERS: "/a" }),
+			{ mode: false, model: false, context: false, tool: false, maxImagesPerCall: false, maxBatch: false, cacheSize: false, videoModel: false, allowHome: true, allowedFolders: true },
 		);
 	});
 });
@@ -821,6 +848,85 @@ describe("isPathAllowed", () => {
 			else process.env.PI_VISION_PROXY_ALLOW_DRIVES = prevDrives;
 		}
 	});
+
+	it("allows homedir via the allowHome config option (no env var)", async () => {
+		const home = os.homedir();
+		const prevHome = process.env.PI_VISION_PROXY_ALLOW_HOME;
+		const prevDrives = process.env.PI_VISION_PROXY_ALLOW_DRIVES;
+		try {
+			process.env.PI_VISION_PROXY_ALLOW_DRIVES = "0";
+			delete process.env.PI_VISION_PROXY_ALLOW_HOME;
+			if (!home.toLowerCase().startsWith(process.cwd().toLowerCase())) {
+				assert.equal(await isPathAllowed(home, { allowHome: false }), false);
+			}
+			assert.equal(await isPathAllowed(home, { allowHome: true }), true);
+		} finally {
+			if (prevHome === undefined) delete process.env.PI_VISION_PROXY_ALLOW_HOME;
+			else process.env.PI_VISION_PROXY_ALLOW_HOME = prevHome;
+			if (prevDrives === undefined) delete process.env.PI_VISION_PROXY_ALLOW_DRIVES;
+			else process.env.PI_VISION_PROXY_ALLOW_DRIVES = prevDrives;
+		}
+	});
+
+	it("allows paths under a configured allowed folder", async () => {
+		const home = os.homedir();
+		const prevDrives = process.env.PI_VISION_PROXY_ALLOW_DRIVES;
+		try {
+			process.env.PI_VISION_PROXY_ALLOW_DRIVES = "0";
+			if (!home.toLowerCase().startsWith(process.cwd().toLowerCase())) {
+				assert.equal(await isPathAllowed(home, { allowedFolders: [] }), false);
+				assert.equal(await isPathAllowed(home, { allowedFolders: ["/nonexistent-root-vp-xyz"] }), false);
+			}
+			assert.equal(await isPathAllowed(home, { allowedFolders: [home] }), true);
+			// Non-existent file directly under an allowed folder passes via parent resolution
+			assert.equal(
+				await isPathAllowed(join(home, "does-not-exist-vp-xyz.png"), { allowedFolders: [home] }),
+				true,
+			);
+		} finally {
+			if (prevDrives === undefined) delete process.env.PI_VISION_PROXY_ALLOW_DRIVES;
+			else process.env.PI_VISION_PROXY_ALLOW_DRIVES = prevDrives;
+		}
+	});
+});
+
+describe("expandLeadingTilde", () => {
+	it("expands ~ and ~/sub to the home directory", () => {
+		assert.equal(expandLeadingTilde("~"), os.homedir());
+		assert.equal(expandLeadingTilde("~/pics"), join(os.homedir(), "pics"));
+	});
+
+	it("leaves other paths untouched", () => {
+		assert.equal(expandLeadingTilde("/a/~/b"), "/a/~/b");
+		assert.equal(expandLeadingTilde("~user/x"), "~user/x");
+		assert.equal(expandLeadingTilde("/plain"), "/plain");
+	});
+});
+
+describe("sanitizeAllowedFolders", () => {
+	it("keeps absolute paths, expands ~, drops relative and non-string entries", () => {
+		const home = os.homedir();
+		const out = sanitizeAllowedFolders(["/a/b", "relative/x", 42, "~/pics", "  /c  ", ""]);
+		assert.deepEqual(out, ["/a/b", join(home, "pics"), "/c"]);
+	});
+
+	it("dedupes case-insensitively and caps at MAX_ALLOWED_FOLDERS", () => {
+		assert.deepEqual(sanitizeAllowedFolders(["/A/B", "/a/b"]), ["/A/B"]);
+		const many = Array.from({ length: MAX_ALLOWED_FOLDERS + 10 }, (_, i) => `/folder-${i}`);
+		assert.equal(sanitizeAllowedFolders(many).length, MAX_ALLOWED_FOLDERS);
+	});
+
+	it("returns empty array for non-arrays", () => {
+		assert.deepEqual(sanitizeAllowedFolders("/a"), []);
+		assert.deepEqual(sanitizeAllowedFolders(undefined), []);
+	});
+});
+
+describe("pathAccessFromConfig", () => {
+	it("extracts allowedFolders and allowHome", () => {
+		const cfg = sanitize({ ...DEFAULT_CONFIG, allowedFolders: ["/media"], allowHome: true });
+		assert.deepEqual(pathAccessFromConfig(cfg), { allowedFolders: ["/media"], allowHome: true });
+	});
 });
 
 describe("readImageFileWithReason", () => {
@@ -948,6 +1054,18 @@ describe("readPersistentFile / writePersistentFile", () => {
 			assert.equal(read.mode, "always");
 			assert.equal(read.provider, "openai");
 			assert.equal(read.modelId, "gpt-4o");
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("round-trips allowedFolders and allowHome", async () => {
+		const dir = await mkdtemp(join(os.tmpdir(), "vp-test-"));
+		try {
+			await writePersistentFile({ allowedFolders: ["/media/photos"], allowHome: true }, dir);
+			const read = await readPersistentFile(dir);
+			assert.deepEqual(read.allowedFolders, ["/media/photos"]);
+			assert.equal(read.allowHome, true);
 		} finally {
 			await rm(dir, { recursive: true, force: true });
 		}
@@ -1501,6 +1619,29 @@ describe("sanitize (1.4.0 fields)", () => {
 		assert.equal(bad.maxImagesPerCall, 10); // reset to default
 		const good = sanitize({ ...DEFAULT_CONFIG, maxImagesPerCall: 15 });
 		assert.equal(good.maxImagesPerCall, 15);
+	});
+});
+
+describe("sanitize (1.9.0 file-access fields)", () => {
+	it("defaults allowedFolders and allowHome when missing or invalid", () => {
+		const result = sanitize({
+			mode: "fallback",
+			provider: "anthropic",
+			modelId: "claude-sonnet-5",
+			systemPrompt: "test",
+			includeContext: true,
+		} as VisionConfig);
+		assert.deepEqual(result.allowedFolders, []);
+		assert.equal(result.allowHome, false);
+		const bad = sanitize({ ...DEFAULT_CONFIG, allowedFolders: "nope" as unknown as string[], allowHome: "yes" as unknown as boolean });
+		assert.deepEqual(bad.allowedFolders, []);
+		assert.equal(bad.allowHome, false);
+	});
+
+	it("filters allowedFolders to absolute paths", () => {
+		const result = sanitize({ ...DEFAULT_CONFIG, allowedFolders: ["/media", "relative/x"], allowHome: true });
+		assert.deepEqual(result.allowedFolders, ["/media"]);
+		assert.equal(result.allowHome, true);
 	});
 });
 

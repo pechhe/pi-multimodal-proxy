@@ -6,7 +6,7 @@
 import { createHash } from "node:crypto";
 import { lstat, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import os from "node:os";
-import { basename, dirname, extname, join, parse, relative } from "node:path";
+import { basename, delimiter, dirname, extname, isAbsolute, join, parse, relative } from "node:path";
 import type { ImageContent as PiAiImage } from "@earendil-works/pi-ai";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import imageSize from "image-size";
@@ -53,6 +53,11 @@ export interface VisionConfig {
 	// of changing unrelated settings; only implicit values may track the
 	// package default (see applyDefaultModelFallback).
 	modelExplicit?: boolean;
+	// 1.9.0 — configurable file-access allowlist (issue #15). Absolute folder
+	// paths granted in addition to the built-in tmp/cwd/drive rules, and a
+	// persisted equivalent of PI_VISION_PROXY_ALLOW_HOME=1.
+	allowedFolders: string[];
+	allowHome: boolean;
 }
 
 export interface ImageMeta {
@@ -659,6 +664,8 @@ export const DEFAULT_CONFIG: VisionConfig = {
 	videoProvider: "xai",
 	videoModelId: "grok-4.3",
 	videoSystemPrompt: DEFAULT_VIDEO_SYSTEM_PROMPT,
+	allowedFolders: [],
+	allowHome: false,
 	groundingModels: {
 		"Qwen/Qwen2.5-VL-3B-Instruct": { format: "qwen_pixels" },
 		"Qwen/Qwen2.5-VL-7B-Instruct": { format: "qwen_pixels" },
@@ -695,6 +702,7 @@ const PERSISTED_CONFIG_KEYS = new Set([
 	"tool", "maxImagesPerCall", "maxBatch", "cacheSize",
 	"pHashSimilarityThreshold", "groundingModels",
 	"videoProvider", "videoModelId", "videoSystemPrompt",
+	"allowedFolders", "allowHome",
 ]);
 
 /** Read config from the persistent file. Returns empty object on any failure. */
@@ -795,10 +803,20 @@ export function readEnvOverrides(env: NodeJS.ProcessEnv = process.env): Partial<
 			overrides.videoModelId = parsed.modelId;
 		}
 	}
+	// 1.9.0 file-access env overrides
+	const allowHomeEnv = env.PI_VISION_PROXY_ALLOW_HOME?.toLowerCase();
+	if (allowHomeEnv !== undefined) {
+		if (allowHomeEnv === "1" || allowHomeEnv === "true" || allowHomeEnv === "yes" || allowHomeEnv === "on") overrides.allowHome = true;
+		else if (allowHomeEnv === "0" || allowHomeEnv === "false" || allowHomeEnv === "no" || allowHomeEnv === "off") overrides.allowHome = false;
+	}
+	const foldersEnv = env.PI_VISION_PROXY_ALLOWED_FOLDERS;
+	if (foldersEnv !== undefined) {
+		overrides.allowedFolders = sanitizeAllowedFolders(foldersEnv.split(delimiter));
+	}
 	return overrides;
 }
 
-export function envFlags(env: NodeJS.ProcessEnv = process.env): { mode: boolean; model: boolean; context: boolean; tool: boolean; maxImagesPerCall: boolean; maxBatch: boolean; cacheSize: boolean; videoModel: boolean } {
+export function envFlags(env: NodeJS.ProcessEnv = process.env): { mode: boolean; model: boolean; context: boolean; tool: boolean; maxImagesPerCall: boolean; maxBatch: boolean; cacheSize: boolean; videoModel: boolean; allowHome: boolean; allowedFolders: boolean } {
 	return {
 		mode: Boolean(env.PI_VISION_PROXY_MODE),
 		model: Boolean(env.PI_VISION_PROXY_MODEL),
@@ -808,6 +826,8 @@ export function envFlags(env: NodeJS.ProcessEnv = process.env): { mode: boolean;
 		maxBatch: env.PI_VISION_PROXY_MAX_BATCH !== undefined,
 		cacheSize: env.PI_VISION_PROXY_CACHE_SIZE !== undefined,
 		videoModel: env.PI_VISION_PROXY_VIDEO_MODEL !== undefined,
+		allowHome: env.PI_VISION_PROXY_ALLOW_HOME !== undefined,
+		allowedFolders: env.PI_VISION_PROXY_ALLOWED_FOLDERS !== undefined,
 	};
 }
 
@@ -825,6 +845,37 @@ export function parseModelString(s: string): { provider: string; modelId: string
 	const modelId = s.slice(slash + 1);
 	if (!PROVIDER_PATTERN.test(provider) || !MODEL_ID_PATTERN.test(modelId)) return null;
 	return { provider, modelId };
+}
+
+/** Upper bound on configurable allowed folders — keeps the persisted file and per-check work small. */
+export const MAX_ALLOWED_FOLDERS = 100;
+
+/** Expand a leading `~` / `~/` to the user's home directory. `~` elsewhere is left untouched. */
+export function expandLeadingTilde(p: string): string {
+	if (p === "~") return os.homedir();
+	if (p.startsWith("~/") || p.startsWith("~\\")) return join(os.homedir(), p.slice(2));
+	return p;
+}
+
+/**
+ * Normalize a user-supplied allowed-folders list: strings only, trimmed,
+ * leading `~` expanded, absolute paths only, case-insensitively deduped, capped.
+ */
+export function sanitizeAllowedFolders(value: unknown): string[] {
+	if (!Array.isArray(value)) return [];
+	const out: string[] = [];
+	const seen = new Set<string>();
+	for (const entry of value) {
+		if (typeof entry !== "string") continue;
+		const expanded = expandLeadingTilde(entry.trim());
+		if (!expanded || !isAbsolute(expanded)) continue;
+		const key = expanded.toLowerCase();
+		if (seen.has(key)) continue;
+		seen.add(key);
+		out.push(expanded);
+		if (out.length >= MAX_ALLOWED_FOLDERS) break;
+	}
+	return out;
 }
 
 export function sanitize(config: VisionConfig): VisionConfig {
@@ -873,6 +924,9 @@ export function sanitize(config: VisionConfig): VisionConfig {
 	if (typeof safe.videoSystemPrompt !== "string" || !safe.videoSystemPrompt) safe.videoSystemPrompt = DEFAULT_CONFIG.videoSystemPrompt;
 	// 1.8.0 field — keep only a real boolean; absence means "implicit model"
 	if (typeof safe.modelExplicit !== "boolean") delete safe.modelExplicit;
+	// 1.9.0 file-access fields
+	safe.allowedFolders = sanitizeAllowedFolders(safe.allowedFolders);
+	if (typeof safe.allowHome !== "boolean") safe.allowHome = DEFAULT_CONFIG.allowHome;
 	return safe;
 }
 
@@ -1276,14 +1330,33 @@ function driveAccessDisabled(): boolean {
 }
 
 /**
+ * User-configurable extension of the file-access allowlist, derived from the
+ * resolved VisionConfig (persisted settings and/or env overrides).
+ */
+export interface PathAccessOptions {
+	/** Extra absolute folder roots granted in addition to the built-in rules. */
+	allowedFolders?: readonly string[];
+	/** Allow the user's home directory (persisted equivalent of PI_VISION_PROXY_ALLOW_HOME=1). */
+	allowHome?: boolean;
+}
+
+/** Extract the file-access options from a resolved config. */
+export function pathAccessFromConfig(config: VisionConfig): PathAccessOptions {
+	return { allowedFolders: config.allowedFolders, allowHome: config.allowHome };
+}
+
+/**
  * Check that a resolved file path is within a safe directory.
- * By default allows tmpdir, /tmp (system-wide Unix temp), cwd, and local Windows drive paths;
- * opt into homedir on non-drive platforms via PI_VISION_PROXY_ALLOW_HOME=1.
+ * By default allows tmpdir, /tmp (system-wide Unix temp), cwd, and local Windows drive paths.
+ * Additional roots come from `access`: a configurable folder allowlist and an
+ * allow-home flag (persisted via /multimodal-proxy folders / allow-home, or the
+ * PI_VISION_PROXY_ALLOWED_FOLDERS / PI_VISION_PROXY_ALLOW_HOME env overrides).
+ * PI_VISION_PROXY_ALLOW_HOME=1 also works when no `access` is passed.
  * Both sides are canonicalized via realpath to handle symlinks and Windows 8.3 short names.
  * If the target file does not exist, the parent directory is resolved so callers can
  * distinguish "allowed dir but missing file" (→ "unreadable") from a genuinely denied path.
  */
-export async function isPathAllowed(filePath: string): Promise<boolean> {
+export async function isPathAllowed(filePath: string, access?: PathAccessOptions): Promise<boolean> {
 	let resolved: string;
 	try {
 		resolved = (await realpath(filePath)).toLowerCase();
@@ -1320,7 +1393,12 @@ export async function isPathAllowed(filePath: string): Promise<boolean> {
 		if (unixTmp && unixTmp !== tmp && isInsideOrSame(resolved, unixTmp)) return true;
 	}
 
-	if (process.env.PI_VISION_PROXY_ALLOW_HOME === "1") {
+	for (const folder of access?.allowedFolders ?? []) {
+		const root = await canonical(folder);
+		if (root && isInsideOrSame(resolved, root)) return true;
+	}
+
+	if (access?.allowHome === true || process.env.PI_VISION_PROXY_ALLOW_HOME === "1") {
 		const home = await canonical(os.homedir?.());
 		if (home && isInsideOrSame(resolved, home)) return true;
 	}
@@ -1333,10 +1411,10 @@ export async function isPathAllowed(filePath: string): Promise<boolean> {
 /**
  * Read an image file and return as base64 ImageContent with a structured reason on failure.
  */
-export async function readImageFileWithReason(filePath: string): Promise<ReadImageResult> {
+export async function readImageFileWithReason(filePath: string, access?: PathAccessOptions): Promise<ReadImageResult> {
 	const mimeType = mimeTypeForExt(filePath);
 	if (!mimeType) return { image: null, reason: "not-an-image" };
-	if (!(await isPathAllowed(filePath))) return { image: null, reason: "denied" };
+	if (!(await isPathAllowed(filePath, access))) return { image: null, reason: "denied" };
 	let content: Buffer;
 	try {
 		content = await readFile(filePath);
@@ -1347,7 +1425,7 @@ export async function readImageFileWithReason(filePath: string): Promise<ReadIma
 	// parent-dir fallback when the file did not yet exist. A symlink could have been
 	// swapped in during that window. Now that the file exists, realpath() resolves it
 	// fully — catching any symlink pointing outside the allow-list (TOCTOU mitigation).
-	if (!(await isPathAllowed(filePath))) return { image: null, reason: "denied" };
+	if (!(await isPathAllowed(filePath, access))) return { image: null, reason: "denied" };
 	if (content.length === 0) return { image: null, reason: "empty", bytes: 0 };
 	const limit = maxImageFileBytes();
 	if (content.length > limit) return { image: null, reason: "too-large", bytes: content.length };
@@ -1388,13 +1466,13 @@ function maxVideoFileBytes(): number {
  * Uses the PiAiImage shape ({ type: "image", data, mimeType }) as a carrier —
  * the onPayload hook rewrites the wire format to the correct video_url / audio type.
  */
-export async function readMediaFileWithReason(filePath: string): Promise<ReadMediaResult> {
+export async function readMediaFileWithReason(filePath: string, access?: PathAccessOptions): Promise<ReadMediaResult> {
 	const ext = extname(filePath).toLowerCase();
 	const videoMime = VIDEO_EXT_TO_MIME[ext];
 	const audioMime = AUDIO_EXT_TO_MIME[ext];
 	const mimeType = videoMime ?? audioMime;
 	if (!mimeType) return { media: null, reason: "not-a-media" };
-	if (!(await isPathAllowed(filePath))) return { media: null, reason: "denied" };
+	if (!(await isPathAllowed(filePath, access))) return { media: null, reason: "denied" };
 	let content: Buffer;
 	try {
 		content = await readFile(filePath);
@@ -1414,8 +1492,8 @@ export async function readMediaFileWithReason(filePath: string): Promise<ReadMed
 /**
  * Read an image file. Returns null on any failure. Prefer readImageFileWithReason for diagnostics.
  */
-export async function readImageFile(filePath: string): Promise<PiAiImage | null> {
-	return (await readImageFileWithReason(filePath)).image;
+export async function readImageFile(filePath: string, access?: PathAccessOptions): Promise<PiAiImage | null> {
+	return (await readImageFileWithReason(filePath, access)).image;
 }
 
 /**
