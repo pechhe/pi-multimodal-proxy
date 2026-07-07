@@ -6,6 +6,10 @@ When images are sent, this extension routes them to a **vision-capable model**, 
 
 When **video or audio files** are detected, they are routed to a **multimodal model** (default: Grok 4.3) that natively understands video content — transcribing speech with speaker diarization, describing visual scenes, reading on-screen text, and reasoning about the content — all in a single call.
 
+## What's new in 1.9.0
+
+- **Hide-able status line** — `/multimodal-proxy status off` hides the steady-state footer status (`multimodal-proxy: fallback → … | video: …`) once you've set up your providers and models. The setting persists across sessions; the transient analysis progress spinner still shows while a call is in flight. Env override: `PI_VISION_PROXY_STATUS_LINE=on|off`.
+
 ## What's new in 1.8.0
 
 - **Media knowledge survives context compaction** — when Pi compacts the conversation, the user messages that carried image attachments (and injected video fences) are summarized away, which previously left the agent blind to all earlier media. The proxy now detects compaction on the active branch and re-injects a **post-compaction recall digest**: truncated image/video descriptions keyed by the same stable `image="..."` ids that `analyze_image` accepts, so the agent can still reason about — and re-query — *"that screenshot from before"* after a `/compact` or auto-compaction.
@@ -69,6 +73,7 @@ Settings persist across sessions in `~/.pi/agent/multimodal-proxy.json`. Environ
 /multimodal-proxy max-images-per-call <1-20>           → max images per tool call
 /multimodal-proxy max-batch <1-10>                     → max images in auto-proxy joint call
 /multimodal-proxy cache-size <0-500>                   → tool result cache entries
+/multimodal-proxy status on | off                      → show/hide the steady status line
 /multimodal-proxy grounding-models list                → show grounding-capable models
 /multimodal-proxy grounding-models add <provider/id> [--format <fmt>]
 /multimodal-proxy grounding-models remove <provider/id>
@@ -95,6 +100,7 @@ Legacy alias: /vision-proxy <args> works identically.
 | `PI_VISION_PROXY_ALLOW_DRIVES` | `0`/`false`/`off` to disable local Windows drive paths; otherwise local drive paths like `D:\Downloads\video.mp4` are allowed | enabled by default |
 | `PI_VISION_PROXY_VIDEO_MODEL` | `provider/model-id` | `xai/grok-4.3` |
 | `PI_VISION_PROXY_MAX_VIDEO_BYTES` | positive integer | `209715200` (200 MB) |
+| `PI_VISION_PROXY_STATUS_LINE` | `on`, `off` | `on` |
 
 When an env var is set, the matching `/multimodal-proxy` subcommand is locked.
 

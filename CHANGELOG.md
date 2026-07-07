@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.9.0] - 2026-07-07
+
+### Added
+
+- **Hide-able status line** ([#16](https://github.com/pungggi/pi-multimodal-proxy/issues/16)) — new persisted `statusLine` setting. `/multimodal-proxy status off` hides the steady-state footer status (`multimodal-proxy: fallback → … | video: …`), `/multimodal-proxy status on` restores it, and the interactive config menu gets a matching toggle. The transient analysis progress spinner still shows while a call is in flight and clears when it finishes. New env override: `PI_VISION_PROXY_STATUS_LINE=on|off`.
+
+### Fixed
+
+- Changing any setting via `/multimodal-proxy` refreshed the status line under the stale `vision-proxy` key with an outdated text format, leaving a second, never-updated status entry alongside the real one. The refresh now uses the same `multimodal-proxy` key and steady-state text (including the video model and registry fallback) as session start.
+
 ## [1.8.0] - 2026-07-04
 
 ### Added

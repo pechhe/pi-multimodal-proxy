@@ -18,6 +18,7 @@
  *                 /multimodal-proxy max-images-per-call <n>
  *                 /multimodal-proxy max-batch <n>
  *                 /multimodal-proxy cache-size <n>
+ *                 /multimodal-proxy status on|off   - show/hide the steady status line
  *
  *   Legacy alias: /vision-proxy <args> works identically.
  *
@@ -31,6 +32,7 @@
  *     PI_VISION_PROXY_CACHE_SIZE       - 0..500
  *     PI_VISION_PROXY_VIDEO_MODEL      - "provider/model-id"
  *     PI_VISION_PROXY_MAX_VIDEO_BYTES  - positive integer
+ *     PI_VISION_PROXY_STATUS_LINE      - "on" | "off"
  *
  * Install:
  *   pi install ./packages/pi-multimodal-proxy
@@ -466,11 +468,16 @@ function friendlyModelLabel(
 	return modelLabel(config);
 }
 
-/** Steady-state status-line text shown when no media call is in flight. */
+/**
+ * Steady-state status-line text shown when no media call is in flight.
+ * Returns undefined (which clears the status entry) when the user hid the
+ * status line via `/multimodal-proxy status off`.
+ */
 function steadyStatusText(
 	config: VisionConfig,
 	registry: ExtensionContext["modelRegistry"],
-): string {
+): string | undefined {
+	if (config.statusLine === "off") return undefined;
 	return (
 		`multimodal-proxy: ${config.mode} → ${friendlyModelLabel(config, registry)} ` +
 		`| video: ${config.videoProvider}/${config.videoModelId}` +
@@ -487,7 +494,7 @@ function steadyStatusText(
 async function withProgress<T>(
 	ctx: ExtensionContext,
 	label: () => string,
-	steady: string,
+	steady: string | undefined,
 	task: () => Promise<T>,
 ): Promise<T> {
 	if (!ctx.hasUI) return task();
@@ -1977,8 +1984,8 @@ export default function (pi: ExtensionAPI) {
 				_fileConfig = validated;
 				const eff = resolveConfig(ctx.sessionManager.getEntries(), process.env, _fileConfig);
 				ctx.ui.setStatus(
-					"vision-proxy",
-					`vision-proxy: ${eff.mode} → ${friendlyModelLabel(eff, ctx.modelRegistry)}${eff.tool === "on" && eff.mode !== "off" ? " [+tool]" : ""}`,
+					"multimodal-proxy",
+					steadyStatusText(withModelFallback(eff, ctx), ctx.modelRegistry),
 				);
 				return validated;
 			};
@@ -2133,6 +2140,32 @@ export default function (pi: ExtensionAPI) {
 				}
 				ctx.ui.notify(
 					`[multimodal-proxy] Tool: ${effective.tool}. Use /multimodal-proxy tool on|off.`,
+					"info",
+				);
+				return;
+			}
+
+			// ── Status line on/off ─────────────────────────────
+			if (sub === "status") {
+				if (env.statusLine) {
+					ctx.ui.notify(
+						"[multimodal-proxy] PI_VISION_PROXY_STATUS_LINE is set - env overrides commands. Unset to change.",
+						"warning",
+					);
+					return;
+				}
+				if (isTrue(valueLower)) {
+					writePersisted({ ...persisted, statusLine: "on" });
+					ctx.ui.notify("[multimodal-proxy] Status line: ON", "info");
+					return;
+				}
+				if (isFalse(valueLower)) {
+					writePersisted({ ...persisted, statusLine: "off" });
+					ctx.ui.notify("[multimodal-proxy] Status line: OFF (progress spinner still shows during analysis)", "info");
+					return;
+				}
+				ctx.ui.notify(
+					`[multimodal-proxy] Status line: ${effective.statusLine === "on" ? "ON" : "OFF"}. Use /multimodal-proxy status on|off.`,
 					"info",
 				);
 				return;
@@ -2550,9 +2583,10 @@ export default function (pi: ExtensionAPI) {
 				`Max images/call: ${effective.maxImagesPerCall}\n` +
 				`Max batch: ${effective.maxBatch}\n` +
 				`Cache size: ${effective.cacheSize}\n` +
+				`Status line: ${effective.statusLine === "on" ? "ON" : "OFF"}\n` +
 				`Consent: ${hasConsent(entries, effective.provider) ? "granted" : "not granted"}\n` +
 				(env.mode || env.model || env.context
-					? `Env overrides: ${[env.mode && "mode", env.model && "model", env.context && "context", env.tool && "tool", env.maxImagesPerCall && "maxImagesPerCall", env.maxBatch && "maxBatch", env.cacheSize && "cacheSize", env.videoModel && "videoModel"]
+					? `Env overrides: ${[env.mode && "mode", env.model && "model", env.context && "context", env.tool && "tool", env.maxImagesPerCall && "maxImagesPerCall", env.maxBatch && "maxBatch", env.cacheSize && "cacheSize", env.videoModel && "videoModel", env.statusLine && "statusLine"]
 							.filter(Boolean)
 							.join(", ")}\n`
 					: "");
@@ -2560,7 +2594,7 @@ export default function (pi: ExtensionAPI) {
 			if (!ctx.hasUI) {
 				ctx.ui.notify(
 					summary +
-						`\nCommands: /multimodal-proxy fallback|always|off | pick | model provider/model-id | video-model provider/model-id | context on|off | consent yes|no | tool on|off | max-images-per-call <n> | max-batch <n> | cache-size <n>`,
+						`\nCommands: /multimodal-proxy fallback|always|off | pick | model provider/model-id | video-model provider/model-id | context on|off | consent yes|no | tool on|off | max-images-per-call <n> | max-batch <n> | cache-size <n> | status on|off`,
 					"info",
 				);
 				return;
@@ -2574,6 +2608,7 @@ export default function (pi: ExtensionAPI) {
 				`Max images/call: ${effective.maxImagesPerCall}`,
 				`Max batch: ${effective.maxBatch}`,
 				`Cache size: ${effective.cacheSize}`,
+				`Status line: ${effective.statusLine === "on" ? "ON" : "OFF"}`,
 				`Consent: ${hasConsent(entries, effective.provider) ? "granted" : "not granted"}`,
 			]);
 
@@ -2670,6 +2705,17 @@ export default function (pi: ExtensionAPI) {
 				}
 				writePersisted({ ...persisted, cacheSize: n });
 				ctx.ui.notify(`Cache size: ${n}`, "info");
+				return;
+			}
+
+			if (choice.startsWith("Status line")) {
+				if (env.statusLine) {
+					ctx.ui.notify("[multimodal-proxy] Env override active for status line.", "warning");
+					return;
+				}
+				const nextStatusLine = effective.statusLine === "on" ? "off" : "on";
+				writePersisted({ ...persisted, statusLine: nextStatusLine });
+				ctx.ui.notify(`Status line: ${nextStatusLine === "on" ? "ON" : "OFF"}`, "info");
 				return;
 			}
 
