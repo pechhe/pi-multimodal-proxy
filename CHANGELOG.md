@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.8.1] - 2026-07-07
+
+### Added
+
+- **Tool-result images are now described via the vision model.** Previously only images attached to *user* messages were routed through the proxy (`before_agent_start` + the `context` hook). Images returned *by tools* — e.g. `read` on a PNG, or screenshot tools — were never described: for non-vision models pi-core silently stripped them (the visual content was lost entirely), and for vision models the raw base64 was sent. A new `tool_result` handler collects any image content blocks a tool returns, describes them via the configured vision model (respecting the same `fallback`/`always` mode and data-egress consent as user images), and replaces each block with the same `[Image - vision-proxy description ...]` fence the `context` hook emits — so `analyze_image` recall and the post-compaction digest keep working. Successful descriptions are persisted (`CUSTOM_TYPE_DESCRIPTION`) exactly like user-image descriptions.
+- New tested helpers in `internal.ts`: `collectToolImageBlocks` (image-block indices + images, in input order) and `replaceToolImageBlocks` (pure transform: image block → description fence, with a "not available" placeholder on per-image failure and the original block preserved when an image can't be decoded).
+
 ## [1.8.0] - 2026-07-04
 
 ### Added

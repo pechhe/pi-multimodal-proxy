@@ -51,6 +51,7 @@ import type {
 	SessionCompactEvent,
 	SessionEntry,
 	SessionStartEvent,
+	ToolResultEvent,
 	TurnEndEvent,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -60,6 +61,9 @@ import {
 	collectVisibleFenceIds,
 	buildConversationContext,
 	buildDescriptionFence,
+	collectToolImageBlocks,
+	replaceToolImageBlocks,
+	type AnalysisResult,
 	buildGroundingInstruction,
 	buildAdaptiveJointPrompt,
 	buildJointDescriptionFence,
@@ -572,12 +576,6 @@ async function ensureConsent(
 }
 
 // ── Core: analyze images via vision model ──────────────────────────────────
-
-interface AnalysisResult {
-	hash: string;
-	description: string | null;
-	error?: string;
-}
 
 async function analyzeImages(
 	images: readonly (PiAiImage | LegacyImage)[],
@@ -1820,6 +1818,61 @@ export default function (pi: ExtensionAPI) {
 	// headroom for the normal budgets.
 	pi.on("turn_end", async (_event: TurnEndEvent, ctx: ExtensionContext) => {
 		getSessionState(ctx).compaction = undefined;
+	});
+
+	pi.on("tool_result", async (event: ToolResultEvent, ctx: ExtensionContext) => {
+		// Tools (read on a PNG, screenshot tools, etc.) can return image blocks.
+		// For non-vision models these would otherwise be stripped by pi-core and
+		// lost entirely; for vision models they'd be sent raw (base64). Describe
+		// them via the vision model here so the description reaches the model and
+		// is cached for analyze_image recall. Mirrors before_agent_start's flow.
+		const { indices, images } = collectToolImageBlocks(event.content);
+		if (images.length === 0) return; // fast path: most tool results carry no image
+
+		const entries = ctx.sessionManager.getEntries();
+		const config = withModelFallback(resolveConfig(entries, process.env, _fileConfig), ctx);
+		if (!shouldStripImages(config, ctx.model)) return; // model supports images → pass through unchanged
+
+		if (!(await ensureConsent(config, ctx, entries, pi))) {
+			// No data-egress consent: leave the image block untouched. pi-core strips
+			// it for non-vision models (unchanged from prior behaviour).
+			return;
+		}
+
+		const results = await analyzeImages(
+			images,
+			`A tool (${event.toolName}) returned this image. Describe it in detail per your system instructions.`,
+			"",
+			config,
+			ctx,
+		);
+		if (!results) return; // analyzeImages already surfaced the error
+
+		const imageMeta = getSessionState(ctx).imageMeta;
+		const newContent = replaceToolImageBlocks(event.content, indices, results, imageMeta);
+
+		// Persist successful descriptions so the context hook + analyze_image
+		// recall can find them (same as before_agent_start).
+		for (const r of results) {
+			if (r.description) {
+				pi.appendEntry<DescriptionEntry>(CUSTOM_TYPE_DESCRIPTION, {
+					hash: r.hash,
+					description: r.description,
+				});
+			}
+		}
+
+		const successful = results.filter((r) => Boolean(r.description));
+		if (successful.length > 0) {
+			ctx.ui.notify(
+				successful.length === results.length
+					? "[multimodal-proxy] ✓ Tool image analysis complete"
+					: `[multimodal-proxy] ✓ Analyzed ${successful.length}/${results.length} tool image${results.length === 1 ? "" : "s"}`,
+				"info",
+			);
+		}
+
+		return { content: newContent };
 	});
 
 	pi.on("context", async (event: ContextEvent, ctx: ExtensionContext) => {
